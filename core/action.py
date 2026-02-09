@@ -45,6 +45,9 @@ class Contents(TypedDict):
 class CafeNotFound(RuntimeError):
     ...
 
+class CafeBannedError(RuntimeError):
+    ...
+
 
 def cur_time() -> str:
     return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
@@ -427,6 +430,9 @@ def write_comment(
     """## Action 7"""
     page.locator(".right_area .f_reply").first.tap(), wait(goto_delay)
     comment_area = page.locator(".comment_textarea").first
+    if page.locator(".CommentViewStop").count() > 0:
+        raise CafeBannedError("현재 활동정지 상태입니다.")
+
     comment_area.locator(".textarea_write").first.tap(), wait(action_delay)
     comment_area.locator(".text_input_area").first.type(comment, delay=100), wait(action_delay)
     if not dry_run:
@@ -504,7 +510,15 @@ def write_article(
         **kwargs
     ) -> NewArticle:
     """## Action 8"""
-    page.locator(".FloatingWriteButton > button").first.tap(), wait(goto_delay)
+    try:
+        with page.expect_event("dialog", timeout=3000) as dialog:
+            page.locator(".FloatingWriteButton > button").first.tap(), wait(goto_delay)
+        raise CafeBannedError(dialog.value)
+    except CafeBannedError as error:
+        raise error
+    except Exception:
+        pass
+
     article = create_article(articles, my_articles, title_limit, contents_limit, **prompt, verbose=verbose, **kwargs)
 
     title_area = page.locator(".ArticleWriteFormSubject textarea").first

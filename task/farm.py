@@ -5,7 +5,8 @@ from core.browser import BrowserController
 from core.login import login, NaverLoginError
 from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
 
-from core.action import goto_cafe_home, goto_cafe, goto_menu, CafeNotFound
+from core.action import CafeNotFound, CafeBannedError
+from core.action import goto_cafe_home, goto_cafe, goto_menu
 from core.action import goto_article, explore_articles
 from core.action import reload_articles, next_articles, go_back
 from core.action import read_article, read_full_article, read_article_and_write_comment
@@ -208,7 +209,7 @@ class ArticleActivity(TypedDict):
 ErrorFlag = Literal[
     "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
-    "가입카페 확인 불가", "반복 횟수 초과", "금지 시간대", "브라우저 조작 오류"]
+    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "금지 시간대", "브라우저 조작 오류"]
 
 class ErrorLog(TypedDict):
     type: str
@@ -749,6 +750,8 @@ class Farmer(BrowserController):
                 return "네이버 로그인 오류"
         elif isinstance(error, CafeNotFound):
             return "가입카페 확인 불가"
+        elif isinstance(error, CafeBannedError):
+            return "카페 활동정지"
         elif isinstance(error, MaxLoopExceeded):
             return "반복 횟수 초과"
         elif isinstance(error, QuietHoursError):
@@ -768,13 +771,19 @@ class Farmer(BrowserController):
                 return False
             except Exception:
                 return True
-        elif flag.startswith("네이버") or (flag == "가입카페 확인 불가"):
+        elif flag.startswith("네이버"):
             userid = self.config.userid
             for config in self.configs:
                 if config.userid == userid:
                     config.zero_counter("all")
-            if flag.startswith("네이버") and (state := self.browser_state) and state.exists():
+            if (state := self.browser_state) and state.exists():
                 os.remove(str(state))
+            return False
+        elif flag in {"가입카페 확인 불가", "카페 활동정지"}:
+            userid, cafe_name = self.config.userid, self.config.cafe_name
+            for config in self.configs:
+                if (config.userid == userid) and (config.cafe_name == cafe_name):
+                    config.zero_counter("all")
             return False
         else:
             return flag.startswith("VPN") or (flag == "금지 시간대")
