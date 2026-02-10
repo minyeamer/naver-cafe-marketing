@@ -144,8 +144,12 @@ class ConfigWrapper(AttrDict):
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
 
-        self.qualified: bool = None
+        self.__qualified: bool = None
         self.__done: bool = None
+
+    @property
+    def qualified(self) -> bool:
+        return self.__qualified
 
     @property
     def done(self) -> bool:
@@ -177,8 +181,15 @@ class ConfigWrapper(AttrDict):
         else:
             self.counter[key] = 0
 
-    def get_left_keys(self) -> list[str]:
-        return [key for key, count in self.counter.items() if count > 0]
+    def qualify(self):
+        if self.__qualified == False:
+            self.reset_counter("article")
+        self.__qualified = True
+
+    def disqualify(self):
+        if self.__qualified != False:
+            self.zero_counter("article")
+        self.__qualified = False
 
 
 class ActionThreshold(AttrDict):
@@ -369,7 +380,7 @@ class Farmer(BrowserController):
 
         stop_task: StopTask = None
 
-        for _ in range(max_retries.get("task_loop") or 10):
+        for _ in range(max_retries.get("task_loop") or 30):
             if stop_task or all([config.done for config in self.configs]):
                 break
 
@@ -384,12 +395,6 @@ class Farmer(BrowserController):
             stop_task = self.task_loop(
                 max_retries, num_my_articles, max_read_length, reload_start_step,
                 wait_until_read, vpn_delay, with_state, verbose, dry_run, save_log)
-
-            if self.write_config:
-                try:
-                    self.write_log_table_to_gsheets(**self.write_config)
-                except:
-                    pass
 
         if self.vpn_enabled:
             self.vpn.terminate_process()
@@ -469,6 +474,12 @@ class Farmer(BrowserController):
             if (not stop_task) and vpn_connected:
                 wait(vpn_delay)
 
+            if self.write_config:
+                try:
+                    self.write_log_table_to_gsheets(**self.write_config)
+                except Exception:
+                    pass
+
         return stop_task
 
     @BrowserController.with_browser
@@ -486,20 +497,18 @@ class Farmer(BrowserController):
         ):
         self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
 
+        if self.config.qualified or self.check_member_level():
+            self.config.qualify()
+            if self.need_my_articles((n := num_my_articles)):
+                self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
+        else:
+            self.config.disqualify()
+
+        self.action_loop(max_steps, max_read_length, reload_start_step, wait_until_read, verbose, dry_run)
+
         qualified = self.check_member_level()
-        self.config.qualified = qualified
-
-        if not qualified:
-            self.config.zero_counter("article")
-        elif self.need_my_articles((n := num_my_articles)):
-            self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
-
-        try:
-            self.action_loop(max_steps, max_read_length, reload_start_step, wait_until_read, verbose, dry_run)
-            self.config.qualified = self.check_member_level()
-        finally:
-            if not qualified:
-                self.config.reset_counter("article")
+        if (not self.config.qualified) and qualified:
+            self.config.qualify()
 
     ############################# <start> #############################
     ########################### Action Loop ###########################
