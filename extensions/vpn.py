@@ -60,21 +60,25 @@ class Client(AttrDict):
 
     ########################## Handle Process #########################
 
-    def start_process(self, force_restart: bool = False) -> bool:
-        is_process_running = self.is_process_running()
-        if force_restart and is_process_running:
+    def start_process(self, force_restart: bool = False):
+        if force_restart:
             self.terminate_process()
-            is_process_running = False
 
-        if not is_process_running:
+        if not self.is_process_running():
             subprocess.Popen([self.exe_path, "connect"], shell=True)
-        return True
 
-    def terminate_process(self, exact: bool = True) -> bool:
-        process_name = self.process_name if exact else f"*{self.process_name}*"
-        return (subprocess.run(["taskkill", "/F", "/IM", process_name],
-                    shell=True, capture_output=True).stdout.decode("cp949", errors="ignore")
-                .startswith("성공:"))
+    def terminate_process(self, exact: bool = True, timeout: float = 30., interval: float = 3.):
+        start_time = time.perf_counter()
+        while (time.perf_counter() - start_time) < timeout:
+            if not self.is_process_running():
+                break
+
+            process_name = self.process_name if exact else f"*{self.process_name}*"
+            if (subprocess.run(["taskkill", "/F", "/IM", process_name],
+                        shell=True, capture_output=True).stdout.decode("cp949", errors="ignore")
+                    .startswith("성공:")):
+                break
+            time.sleep(interval)
 
     def is_process_running(self) -> bool:
         return bool(

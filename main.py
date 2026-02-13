@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from task.farm import Farmer, MaxRetries, QuiteHours
+from core.action import Wpm
 from extensions.gsheets import WorksheetConnection
 from extensions.vpn import VpnConfig
 from utils.common import Delay
@@ -10,7 +11,9 @@ import os
 import yaml
 
 if TYPE_CHECKING:
+    from typing import Literal
     from pathlib import Path
+    import datetime as dt
 
 
 CONFIGS = [
@@ -35,13 +38,17 @@ class ReadConfig(TypedDict):
     quiet_hours: QuiteHours
     comment_threshold: float
     like_threshold: float
+    write_threshold: float
+    dst_wpm: Wpm
+    src_wpm: Wpm
 
 class RunConfig(TypedDict, total=False):
     max_retries: MaxRetries
     num_my_articles: int
     max_read_length: int
+    max_reply_length: int
     reload_start_step: int
-    wait_until_read: bool
+    reply_cutoff_date: dt.date | str | Literal["today"]
     task_delay: float
     vpn_delay: float
     with_state: bool
@@ -64,9 +71,10 @@ def main(
         run: RunConfig,
         vpn: VpnConfig,
         write: WorksheetConnection,
-    ):
+    ) -> Farmer:
     farmer = Farmer(**browser, **read, vpn_config=vpn, write_config=write)
     farmer.start(**run)
+    return farmer
 
 
 if __name__ == "__main__":

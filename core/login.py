@@ -38,7 +38,7 @@ def login(
     login_action(page, userid, passwd, mobile, action_delay, goto_delay)
 
     success_url = cafe_url(mobile) if referer == "cafe" else main_url(mobile)
-    if get_page_url(page) != success_url:
+    if get_page_url(page).startswith(success_url):
         if page.locator("#error_message").count() > 0:
             message = page.locator("#error_message").first.text_content().strip()
             raise NaverLoginFailedError(message)

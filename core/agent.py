@@ -4,6 +4,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 import openai
 
 from utils.common import print_json
+from utils.date import cur_time_str
 
 from typing import TypeVar, TypedDict, TYPE_CHECKING
 from pathlib import Path
@@ -26,12 +27,14 @@ class Prompt4(TypedDict, total=False):
     messages: list[Message] | None
     markdown_path: str | Path | None
     temperature: float | None
+    replacements: dict[str,str]
 
 class Prompt5(TypedDict, total=False):
     model: ChatModel | None
     messages: list[Message] | None
     markdown_path: str | Path | None
     reasoning_effort: Literal["minimal","low","medium","high"] | None
+    replacements: dict[str,str]
 
 
 class ArticleParams(TypedDict):
@@ -59,6 +62,13 @@ class NewArticle(TypedDict, total=False):
     contents: list[str]
     type: int
     emotion: int
+    created_at: str
+    violation_reason: int | None
+
+class ModifiedArticle(TypedDict, total=False):
+    title: str
+    contents: list[str]
+    origin: int
     created_at: str
     violation_reason: int | None
 
@@ -111,10 +121,6 @@ def read_markdown(
     return model, messages
 
 
-def cur_time() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
-
-
 def min_json(data: dict | list) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(',', ':'), default=str)
 
@@ -139,6 +145,7 @@ def chat(
     content = _get_content(response)
     print_json({
         **({"agent_name": agent_name} if agent_name else {}),
+        "model": model,
         "content": content,
         "inference_time": round(time.perf_counter() - start_time, 1),
         "tokens": json.dumps(_get_tokens_suage(response)).replace('\"', '\'')
@@ -157,6 +164,7 @@ def chat_json(
     response = openai.chat.completions.create(model=model, messages=messages, **kwargs)
     message = {
         **({"agent_name": agent_name} if agent_name else {}),
+        "model": model,
         "content": _get_content(response),
         "inference_time": round(time.perf_counter() - start_time, 1),
         "tokens": json.dumps(_get_tokens_suage(response)).replace('\"', '\'')
@@ -192,6 +200,7 @@ def select_articles(
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         temperature: float | None = 0.1,
+        replacements: dict[str,str] = dict(),
         verbose: int | str | Path = 0,
         **kwargs
     ) -> list[ArticleParams]:
@@ -217,7 +226,7 @@ def select_articles(
     if messages is None:
         data = [{"articleid": article["articleid"], "title": article["title"]}
                 for article in articles if not is_question(article["title"])]
-        model, messages = read_markdown(markdown_path, min_json(data), model)
+        model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:
         print_json({"agent_name": name, "user_message": messages[-1]["content"]}, verbose)
@@ -243,11 +252,11 @@ def is_question(title: str) -> bool:
 
 def create_comment(
         article_info: ArticleInfo = dict(),
-        comment_limit: str = "20자 이내",
         model: ChatModel | None = None,
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        replacements: dict[str,str] = dict(),
         verbose: int | str | Path = 0,
         **kwargs
     ) -> str:
@@ -273,8 +282,8 @@ def create_comment(
     """
     name = "create_comment"
     if messages is None:
-        data = dict(article_info, current_time=cur_time())
-        model, messages = read_markdown(markdown_path, min_json(data), model, comment_limit=comment_limit)
+        data = dict(article_info, current_time=cur_time_str())
+        model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:
         print_json({"agent_name": name, "user_message": messages[-1]["content"]}, verbose)
@@ -292,18 +301,72 @@ def create_comment(
 
 
 ###################################################################
-#################### Agent 3: :create_article: ####################
+#################### Agent 3: :create_replies: ####################
+###################################################################
+
+def create_replies(
+        article_info: ArticleInfo = dict(),
+        model: ChatModel | None = None,
+        messages: list[Message] | None = None,
+        markdown_path: str | Path | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        replacements: dict[str,str] = dict(),
+        verbose: int | str | Path = 0,
+        **kwargs
+    ) -> list[str]:
+    """
+    ### MARKDOWN FORMAT
+    ```
+    '${model}\\n<--->\\n${system-content}\\n<--->\\n${user-content}\\n${assistant-content}'
+    ```
+    ### INPUT FORMAT
+    ```
+    {
+        "title": "제목",
+        "contents": ["문장1", "![alt](url)", "문장2"],
+        "comments": ["댓글1", "댓글2"],
+        "created_at": "2026-01-02T12:04:05+09:00",
+        "current_time": "2026-01-02T12:04:05+09:00"
+    }
+    ```
+    ### OUTPUT FORMAT
+    ```
+    [{"comment":null,"reject_reason":null,"violation_reason":null},{"comment":null,"reject_reason":null,"violation_reason":null}]
+    ```
+    """
+    name = "create_replies"
+    if messages is None:
+        data = dict(article_info, current_time=cur_time_str())
+        model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
+        print_json({"agent_name": name, "user_message": data}, verbose)
+    else:
+        print_json({"agent_name": name, "user_message": messages[-1]["content"]}, verbose)
+
+    if isinstance(reasoning_effort, str):
+        kwargs["reasoning_effort"] = reasoning_effort
+
+    try:
+        comments = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
+        return [comment["comment"] for comment in comments
+            if (isinstance(comment, dict) and comment.get("comment")
+                and not (comment.get("reject_reason") or comment.get("violation_reason")))]
+    except Exception as e:
+        print_json({"agent_name": name, "error": str(type(e)), "message": str(e)}, verbose)
+    return list()
+
+
+###################################################################
+#################### Agent 4: :create_article: ####################
 ###################################################################
 
 def create_article(
         articles: Iterable[ArticleInfo] = list(),
         my_articles: Iterable[str] = list(),
-        title_limit: str = "30자 이내",
-        contents_limit: str = "300자 이내",
         model: ChatModel | None = None,
         messages: list[Message] | None = None,
         markdown_path: str | Path | None = None,
         reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        replacements: dict[str,str] = dict(),
         verbose: int | str | Path = 0,
         **kwargs
     ) -> NewArticle:
@@ -335,11 +398,10 @@ def create_article(
     {"title":"제목","contents":["문장1","문장2"],"type":null,"emotion":null,"violation_reason":null}
     ```
     """
-    name = "create_article"
+    name = kwargs.pop("agent_name", "create_article")
     if messages is None:
-        data = {"articles": list(articles), "my_articles": list(my_articles), "current_time": cur_time()}
-        limit = dict(title_limit=title_limit, contents_limit=contents_limit)
-        model, messages = read_markdown(markdown_path, min_json(data), model, **limit)
+        data = {"articles": list(articles), "my_articles": list(my_articles), "current_time": cur_time_str()}
+        model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:
         print_json({"agent_name": name, "user_message": messages[-1]["content"]}, verbose)
@@ -355,3 +417,51 @@ def create_article(
     except Exception as e:
         print_json({"agent_name": name, "error": str(type(e)), "message": str(e)}, verbose)
     return dict()
+
+
+###################################################################
+#################### Agent 5: :modify_article: ####################
+###################################################################
+
+def modify_article(
+        articles: Iterable[ArticleInfo] = list(),
+        my_articles: Iterable[str] = list(),
+        model: ChatModel | None = None,
+        messages: list[Message] | None = None,
+        markdown_path: str | Path | None = None,
+        reasoning_effort: Literal["minimal","low","medium","high"] | None = "high",
+        replacements: dict[str,str] = dict(),
+        verbose: int | str | Path = 0,
+        **kwargs
+    ) -> ModifiedArticle:
+    """
+    ### MARKDOWN FORMAT
+    ```
+    '${model}\\n<--->\\n${system-content}\\n<--->\\n${user-content}\\n${assistant-content}'
+    ```
+    ### INPUT FORMAT
+    ```
+    {
+        "articles": [{
+            "title": "제목",
+            "contents": ["문장1", "![alt](url)", "문장2"],
+            "comments": ["댓글1", "댓글2"],
+            "created_at": "2026-01-02T12:04:05+09:00"
+        }],
+        "my_articles": [{
+            "title": "제목",
+            "contents": ["문장1", "![alt](url)", "문장2"],
+            "comments": ["댓글1", "댓글2"],
+            "created_at": "2026-01-02T12:04:05+09:00"
+        }],
+        "current_time": "2026-01-02T12:04:05+09:00"
+    }
+    ```
+    ### OUTPUT FORMAT
+    ```
+    {"title":"제목","contents":["문장1","문장2"],"origin":0,"violation_reason":null}
+    ```
+    """
+    kwargs["agent_name"] = "modify_article"
+    return create_article(
+        articles, my_articles, model, messages, markdown_path, reasoning_effort, replacements, verbose, **kwargs)

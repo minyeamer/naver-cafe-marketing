@@ -5,12 +5,12 @@ from core.browser import BrowserController
 from core.login import login, NaverLoginError
 from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
 
-from core.action import CafeNotFound, CafeBannedError
-from core.action import goto_cafe_home, goto_cafe, goto_menu
+from core.action import CafeNotFound, CafeBannedError, Wpm, ActionLog
+from core.action import goto_cafe_home, goto_cafe, goto_menu, return_to_cafe_home
 from core.action import goto_article, explore_articles
 from core.action import reload_articles, next_articles, go_back
 from core.action import read_article, read_full_article, read_article_and_write_comment
-from core.action import like_article, write_article
+from core.action import write_article, update_article, like_article, reply_my_articles
 from core.action import read_my_articles, open_info, close_info, read_action_log
 
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
@@ -24,9 +24,10 @@ from utils.common import AttrDict, Delay, wait, print_json
 from utils.timer import ActionTimer
 
 from typing import get_type_hints, Literal, TypeVar, TypedDict, TYPE_CHECKING
-from collections import defaultdict, deque
+from collections import deque
 import datetime as dt
 import json
+import re
 
 from pathlib import Path
 import os
@@ -35,8 +36,9 @@ import sys
 import traceback
 
 if TYPE_CHECKING:
-    from typing import Any
-    from core.action import ArticleId, ArticleInfo, Comment, NewArticle
+    from typing import Any, Sequence
+    from core.action import ArticleId, CafeId, Comment, Replies
+    from core.agent import ArticleInfo, NewArticle, ModifiedArticle
     from extensions.gsheets import WorksheetConnection
 
 class QuiteHours(TypedDict):
@@ -72,7 +74,22 @@ class QuietHoursError(RuntimeError):
 class MaxRetries(TypedDict, total=False):
     task_loop: int
     action_loop: int
+    read_loop: int
     vpn_connect: int
+
+class ArticleIdInfo(TypedDict):
+    clubid: str
+    articleid: str
+    title: str
+    contents: list[str]
+    comments: list[str]
+    created_at: str
+
+
+def seconds_to_mmss(secs: float) -> str:
+    total = int(round(secs))
+    m, s = divmod(total, 60)
+    return f"{m:02d}:{s:02d}"
 
 
 ###################################################################
@@ -80,23 +97,31 @@ class MaxRetries(TypedDict, total=False):
 ###################################################################
 
 class Config(TypedDict):
-    row_no: int
+    no: int
     userid: str
     passwd: str
     ip_addr: str
-    cafe_name: str
-    menu_name: str
+    dst_cafe: str
+    dst_menu: str
+    src_cafe: str
+    src_menu: str
     read_count: str
     comment_count: str
     comment_delay: int
+    daily_comment_limit: int
     article_count: str
     article_delay: int
+    daily_article_limit: int
     like_count: str
+    min_line_limit: int
+    comment_length: str
+    reply_yn: bool
     visit_limit: int
     comment_limit: int
-    comment_length: str
-    title_length: str
-    contents_length: str
+    last_active_ts: dt.datetime
+    total_visit_count: int
+    total_article_count: int
+    total_comment_count: int
 
 class ActionCount(TypedDict):
     read: int
@@ -112,23 +137,43 @@ class ActionDelay(TypedDict):
 class ActionLimit(TypedDict):
     visit: int
     comment: int
+    daily_comment: int
+    daily_article: int
+    min_line: int
 
 class WordLength(TypedDict):
-    title: str
-    contents: str
+    # title: str
+    # contents: str
     comment: str
+
+class ActionStatus(TypedDict):
+    done: bool
+    qualified: bool
+
+
+class CafeInfo(AttrDict):
+    def __init__(self, name: str, menu: str):
+        self.name = name
+        self.menu = menu
+
+class CafePair(AttrDict):
+    def __init__(self, dst: CafeInfo, src: CafeInfo):
+        self.dst = dst if isinstance(dst, CafeInfo) else CafeInfo(**dst)
+        self.src = src if isinstance(src, CafeInfo) else CafeInfo(**src)
 
 
 class ConfigWrapper(AttrDict):
 
     def __init__(self, config: Config = dict(), **kwargs):
         super().__init__()
-        self.row_no = config["row_no"]
+        self.no = config["no"]
         self.userid = config["userid"]
         self.passwd = config["passwd"]
         self.ip_addr = config["ip_addr"]
-        self.cafe_name = config["cafe_name"]
-        self.menu_name = config["menu_name"]
+        self.cafe: CafePair = CafePair(
+            dst = dict(name=config["dst_cafe"], menu=config["dst_menu"]),
+            src = dict(name=config["src_cafe"], menu=config["src_menu"]),
+        )
 
         def safe_int(value: int | str) -> int:
             try: return int(value)
@@ -143,61 +188,80 @@ class ConfigWrapper(AttrDict):
         self.delay: ActionDelay = {key[:-len("_delay")]: safe_int(config[key]) for key in config.keys() if key.endswith("_delay")}
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
+        self.reply_yn: bool = config["reply_yn"]
 
-        self.__qualified: bool = None
-        self.__done: bool = None
-
-    @property
-    def qualified(self) -> bool:
-        return self.__qualified
+        self.__log: TaskLog = TaskLog(config)
+        self.__status: ActionStatus = dict(done=None, qualified=None)
+        self.__timer: ActionTimer = ActionTimer()
 
     @property
     def done(self) -> bool:
-        if not self.__done:
-            self.__done = ((self.counter["comment"] == 0) and (self.counter["like"] == 0) and ((self.counter["article"] == 0)))
-            return self.__done
+        if not self.__status["done"]:
+            self.__status["done"] = (
+                    self.qualified
+                and (self.counter["comment"] == 0)
+                and (self.counter["like"] == 0)
+                and ((self.counter["article"] == 0)))
+            return self.__status["done"]
         else:
             return True
 
-    def calc_counter(self, key: Literal["read","comment","article","like"]) -> int:
+    @property
+    def qualified(self) -> bool:
+        return self.__status["qualified"]
+
+    @property
+    def log(self) -> TaskLog:
+        return self.__log
+
+    @property
+    def timer(self) -> ActionTimer:
+        return self.__timer
+
+    def calc_counter(self, key: Literal["read","article","comment","like"]) -> int:
         return self.__counter.get(key, 0) - self.counter.get(key, 0)
 
-    def reset_counter(self, key: Literal["all","read","comment","article","like"]):
+    def reset_counter(self, key: Literal["all","read","article","comment","like"]):
         if key == "all":
             self.counter[key] = {key: self.__counter.get(key, 0) for key in self.counter.keys()}
         else:
             self.counter[key] = self.__counter.get(key, 0)
 
-    def sub_counter(self, key: Literal["all","read","comment","article","like"]):
+    def sub_counter(self, key: Literal["all","read","article","comment","like"]):
         if key == "all":
             self.counter[key] = {key: (self.counter[key] - 1) for key in self.counter.keys()}
         else:
             self.counter[key] = self.counter[key] - 1
 
-    def zero_counter(self, key: Literal["all","read","comment","article","like"]):
+    def zero_counter(self, key: Literal["all","read","article","comment","like"]):
         if key == "all":
             self.counter[key] = {key: 0 for key in self.counter.keys()}
-            self.__done = True
+            self.__status["done"] = True
         else:
             self.counter[key] = 0
 
     def qualify(self):
-        if self.__qualified == False:
+        if self.__status["qualified"] == False:
             self.reset_counter("article")
-        self.__qualified = True
+        self.__status["qualified"] = True
 
     def disqualify(self):
-        if self.__qualified != False:
+        if self.__status["qualified"] != False:
             self.zero_counter("article")
-        self.__qualified = False
+        self.__status["qualified"] = False
+
+    def public_items(self) -> dict:
+        filter_private = (lambda _ConfigWrapper = None, **kwargs: kwargs)
+        return filter_private(**self)
 
 
 class ActionThreshold(AttrDict):
 
-    def __init__(self, comment: float = 0.3, like: float = 0.4):
+    def __init__(self, comment: float = 0.3, like: float = 0.4, write: float = 0.5):
         super().__init__()
         self.comment = comment
         self.like = like
+        self.write = write
 
 
 ###################################################################
@@ -220,7 +284,7 @@ class ArticleActivity(TypedDict):
 ErrorFlag = Literal[
     "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
-    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "금지 시간대", "브라우저 조작 오류"]
+    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대", "브라우저 조작 오류"]
 
 class ErrorLog(TypedDict):
     type: str
@@ -231,26 +295,32 @@ class ErrorLog(TypedDict):
 
 class TaskLog(AttrDict):
 
-    def __init__(self):
-        self.last_active_ts: dt.datetime | None = None
-        self.time_on_cafe: float | None = None
-        self.visit_count: int | None = None
-        self.article_count: int | None = None
-        self.comment_count: int | None = None
-        self.read_ids: set[ArticleId] = set()
+    def __init__(self, config: Config = dict()):
+        self.last_active_ts: dt.datetime | None = config.get("last_active_ts")
+        self.time_on_cafe: float | None = config.get("time_on_cafe")
+        self.user_info: ActionLog = dict(
+            total = dict(
+                visit = config.get("total_visit_count"),
+                article = config.get("total_article_count"),
+                comment = config.get("total_comment_count"),
+            ),
+            today = dict(),
+        )
+        self.read_ids: dict[Literal["dst","src"], set[ArticleId]] = dict(dst=set(), src=set())
         self.read_articles: list[ArticleActivity] = list()
         self.my_articles: deque[ArticleInfo] = deque()
         self.written_articles: list[NewArticle] = list()
+        self.written_replies: list[Replies] = list()
         self.total_steps: int = 0
         self.error: ErrorLog | None = None
 
     def to_json(self, ellipsis_list: bool = False) -> dict:
         def serialize(kv: tuple[str, Any]) -> tuple[str, Any]:
-            if kv[0] == "last_active_ts":
+            if kv[0] in "last_active_ts":
                 ts = (kv[1].strftime("%Y-%m-%dT%H:%M:%S")+"+09:00") if isinstance(kv[1], dt.datetime) else None
                 return kv[0], ts
             elif kv[0] == "read_ids":
-                return kv[0], ','.join(kv[1])
+                return kv[0], dict(dst=','.join(kv[1]["dst"]), src=','.join(kv[1]["src"]))
             elif kv[0] in ("read_articles", "my_articles", "written_articles"):
                 return kv[0], len(kv[1]) if ellipsis_list else list(kv[1])
             else:
@@ -259,20 +329,23 @@ class TaskLog(AttrDict):
 
 
 class LogTableRow(TypedDict):
-    row_no: int
+    no: int
     userid: str
     cafe_name: str
     menu_name: str
     ip_addr: str
     last_active_ts: dt.datetime
-    time_on_cafe: float
-    visit_count: int
-    article_count: int
-    comment_count: int
+    time_on_cafe: str
+    total_visit_count: int
+    total_article_count: int
+    total_comment_count: int
+    today_article_count: int
+    today_comment_count: int
     read_ids: str
     read_articles: int
     new_article_count: int
     new_comment_count: int
+    new_reply_count: int
     new_like_count: int
     total_steps: int
     error_flag: ErrorFlag
@@ -282,11 +355,13 @@ class LogTableRow(TypedDict):
 ###################### Task Executor - Farmer #####################
 ###################################################################
 
+AFTER, BEFORE, IN_LOOP = "after", "before", "in_loop"
+
 class Farmer(BrowserController):
 
     def __init__(
             self,
-            configs: WorksheetConnection,
+            configs: WorksheetConnection | Sequence[Config],
             openai_key:  str | Path | Literal[":default:"] = ":default:",
             device: str = str(),
             mobile: bool = True,
@@ -298,6 +373,9 @@ class Farmer(BrowserController):
             quiet_hours: QuiteHours = dict(),
             comment_threshold: float = 0.3,
             like_threshold: float = 0.4,
+            write_threshold: float = 0.4,
+            dst_wpm: Wpm = dict(),
+            src_wpm: Wpm = dict(),
             vpn_config: VpnConfig = dict(),
             write_config: WorksheetConnection = dict(),
             **kwargs
@@ -307,15 +385,20 @@ class Farmer(BrowserController):
         self.quiet_hours = quiet_hours
         self.check_quiet_hours()
 
-        self.validate_worksheet_connection(configs, empty=False)
-        self.configs = self.read_configs_from_gsheets(**configs)
+        if isinstance(configs, dict):
+            self.validate_worksheet_connection(configs, empty=False)
+            self.configs: list[ConfigWrapper] = self.read_configs_from_gsheets(**configs)
+        elif isinstance(configs, Sequence):
+            self.configs: list[ConfigWrapper] = [ConfigWrapper(config) for config in configs]
+        else:
+            raise ValueError("설정이 올바르지 않습니다.")
 
         set_api_key(DEFAULTS["openai_key"] if is_default(openai_key) else openai_key)
 
         self.index: Index = 0
-        self.logs: dict[Index, TaskLog] = defaultdict(TaskLog)
-        self.timers: dict[Index, ActionTimer] = defaultdict(ActionTimer)
-        self.threshold = ActionThreshold(comment_threshold, like_threshold)
+        self.threshold = ActionThreshold(comment_threshold, like_threshold, write_threshold)
+        self.wpm: dict[Literal["dst","src"], Wpm] = dict(dst=dst_wpm, src=src_wpm)
+        self.original_articles: set[tuple[CafeId, ArticleId]] = set()
 
         self.set_vpn_client(vpn_config)
 
@@ -328,11 +411,7 @@ class Farmer(BrowserController):
 
     @property
     def log(self) -> TaskLog:
-        return self.logs[self.index]
-
-    @property
-    def timer(self) -> ActionTimer:
-        return self.timers[self.index]
+        return self.configs[self.index].log
 
     @property
     def delays2(self) -> dict[str,Delay]:
@@ -361,8 +440,9 @@ class Farmer(BrowserController):
             max_retries: MaxRetries = dict(),
             num_my_articles: int = 10,
             max_read_length: int = 500,
+            max_reply_length: int = 100,
             reload_start_step: int = 10,
-            wait_until_read: bool = True,
+            reply_cutoff_date: dt.date | str | Literal["today","yesterday"] = "today",
             task_delay: float = 5.,
             vpn_delay: float = 5.,
             with_state: bool = True,
@@ -379,42 +459,66 @@ class Farmer(BrowserController):
                 self.vpn.restart_service(**self.vpn_config.login)
 
         stop_task: StopTask = None
+        reply_cutoff_date = self.get_cutoff_date(reply_cutoff_date)
 
-        for _ in range(max_retries.get("task_loop") or 30):
+        for step in range(1, (max_retries.get("task_loop") or 30)+1):
             if stop_task or all([config.done for config in self.configs]):
                 break
 
             if isinstance(stop_task, bool):
-                comment_min_delay = self.min_action_delay("comment")
-                article_min_delay = self.min_action_delay("article")
-                delay = max(task_delay, min(comment_min_delay, article_min_delay))
-
-                self.print_loop("wait", verbose, seconds=delay)
-                wait(delay)
+                self.wait_task_loop(step, task_delay, verbose)
 
             stop_task = self.task_loop(
-                max_retries, num_my_articles, max_read_length, reload_start_step,
-                wait_until_read, vpn_delay, with_state, verbose, dry_run, save_log)
+                step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
+                reply_cutoff_date, vpn_delay, with_state, verbose, dry_run, save_log)
 
         if self.vpn_enabled:
             self.vpn.terminate_process()
 
-    def min_action_delay(self, key: Literal["comment","article"]) -> float:
-        delays = [max(0., self.configs[index].delay[key] - secs)
-            for index, timer in self.timers.items()
-                if isinstance(secs := timer.get_elapsed_time(key), float)]
-        return min(delays) if delays else 0.
+    def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today","yesterday"] = "today") -> dt.date:
+        if isinstance(cutoff_date, str):
+            if cutoff_date == "today":
+                return dt.date.today()
+            elif cutoff_date == "yesterday":
+                return dt.date.today() - dt.timedelta(days=1)
+            else:
+                return dt.datetime.strptime(cutoff_date, "%Y-%m-%d").date()
+        else:
+            return cutoff_date if isinstance(cutoff_date, dt.date) else dt.date.today()
+
+    def wait_task_loop(self, loop_step: int, task_delay: float = 5., verbose: int | str | Path = 0):
+        comment_min_delay = self.min_action_delay("comment")
+        article_min_delay = self.min_action_delay("article")
+
+        if not isinstance(comment_min_delay, float):
+            min_delay = article_min_delay or 0.
+        elif not isinstance(article_min_delay, float):
+            min_delay = comment_min_delay or 0.
+        else:
+            min_delay = min(comment_min_delay, article_min_delay)
+
+        delay = max(task_delay, min_delay)
+        self.print_loop("task_loop_wait", loop_step, verbose, seconds=delay)
+        wait(delay)
+
+    def min_action_delay(self, key: Literal["comment","article"]) -> float | None:
+        delays = [max(0., config.delay[key] - secs)
+            for config in self.configs
+                if (config.counter[key] > 0) and isinstance(secs := config.timer.get_elapsed_time(key), float)]
+        return min(delays) if delays else None
 
     ############################# <start> #############################
     ############################ Task Loop ############################
 
     def task_loop(
             self,
+            loop_step: int,
             max_retries: MaxRetries = dict(),
             num_my_articles: int = 10,
             max_read_length: int = 500,
+            max_reply_length: int = 100,
             reload_start_step: int = 10,
-            wait_until_read: bool = True,
+            reply_cutoff_date: dt.date | None = None,
             vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
@@ -422,7 +526,6 @@ class Farmer(BrowserController):
             save_log: bool = True,
         ) -> StopTask:
         stop_task, flag = False, None
-        max_steps = max_retries.get("action_loop") or 100
         max_vpn_retries = max_retries.get("vpn_connect") or 5
 
         for i in range(len(self.configs)):
@@ -431,12 +534,12 @@ class Farmer(BrowserController):
             if self.config.done:
                 continue
             elif stop_task:
-                self.print_loop("break", verbose)
+                self.print_loop("task_loop_break", loop_step, verbose)
                 self.config.zero_counter("all")
                 continue
 
             state = self.browser_state if with_state else None
-            self.print_loop("start", verbose, state=state)
+            self.print_loop("task_loop_start", loop_step, verbose, state=state)
             vpn_connected = False
 
             try:
@@ -447,8 +550,8 @@ class Farmer(BrowserController):
 
                 try:
                     self.do_actions(
-                        max_steps, num_my_articles, max_read_length, reload_start_step,
-                        wait_until_read, verbose, dry_run, state=state)
+                        max_retries, num_my_articles, max_read_length, max_reply_length,
+                        reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
                     self.log.error = None
                 finally:
                     if vpn_connected:
@@ -463,8 +566,8 @@ class Farmer(BrowserController):
                 )
 
             self.log.last_active_ts = dt.datetime.now()
-            self.log.time_on_cafe = self.timer.end_timer("visit", 3)
-            self.print_loop("end", verbose)
+            self.log.time_on_cafe = self.config.timer.end_timer("visit", 3)
+            self.print_loop("task_loop_end", loop_step, verbose)
 
             if save_log:
                 self.save_log_json()
@@ -482,52 +585,191 @@ class Farmer(BrowserController):
 
         return stop_task
 
+    ###################### Single account actions #####################
+
     @BrowserController.with_browser
     def do_actions(
             self,
-            max_steps: int = 100,
+            max_retries: MaxRetries = dict(),
             num_my_articles: int = 10,
             max_read_length: int = 500,
+            max_reply_length: int = 100,
             reload_start_step: int = 10,
-            wait_until_read: bool = True,
+            reply_cutoff_date: dt.date | None = None,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             *,
             state: str | Path | None = None,
         ):
         self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
+        write_timing = self.get_write_timing(num_my_articles)
 
-        if self.config.qualified or self.check_member_level():
-            self.config.qualify()
-            if self.need_my_articles((n := num_my_articles)):
-                self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
-        else:
-            self.config.disqualify()
+        max_action_steps = max_retries.get("action_loop") or 100
+        max_read_steps = max_retries.get("read_loop") or 100
+        common = (max_read_length, reload_start_step, verbose, dry_run)
 
-        self.action_loop(max_steps, max_read_length, reload_start_step, wait_until_read, verbose, dry_run)
+        if (write_timing == BEFORE) and self.has_next_article():
+            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
 
-        qualified = self.check_member_level()
+        is_article_allowed = (write_timing == IN_LOOP)
+        self.action_loop(max_action_steps, is_article_allowed, *common)
+
+        if (write_timing == AFTER) and self.has_next_article():
+            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
+
+        if self.config.reply_yn:
+            self.reply_my_articles(reply_cutoff_date, max_reply_length, verbose, dry_run)
+
+        qualified = self.check_action_log(total_only=False)
         if (not self.config.qualified) and qualified:
             self.config.qualify()
 
-    ############################# <start> #############################
-    ########################### Action Loop ###########################
+            if self.config.cafe.src.name:
+                self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
 
-    def action_loop(
+    ###################### Read and write article #####################
+
+    def read_src_cafe_and_write_dst_cafe(
             self,
             max_steps: int = 100,
             max_read_length: int = 500,
             reload_start_step: int = 10,
-            wait_until_read: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
-        ):
+        ) -> NewArticle:
+        self.navigate_to_menu(referer="cafe", target="src")
+        articles = self.read_loop(max_steps, max_read_length, reload_start_step, verbose)
+
+        self.navigate_to_menu(referer="cafe", target="dst")
+        new_article = self.copy_and_write_article(articles, verbose, dry_run)
+        self.log.written_articles.append(new_article)
+
+        return new_article
+
+    def get_write_timing(
+            self,
+            num_my_articles: int = 10,
+        ) -> Literal["after","before","in_loop"] | None:
+        if self.config.qualified or self.check_action_log(total_only=bool(self.log.user_info["today"])):
+            self.config.qualify()
+
+            if self.need_my_articles((n := num_my_articles)):
+                self.log.my_articles = deque(self.read_my_articles(n), maxlen=n)
+
+            if self.config.cafe.src.name:
+                return AFTER if random.uniform(0, 1) > self.threshold.write else BEFORE
+            else:
+                return IN_LOOP
+        else:
+            self.config.disqualify()
+            return None
+
+    def copy_and_write_article(
+            self,
+            articles: list[ArticleIdInfo],
+            verbose: int | str | Path = 0,
+            dry_run: bool = False,
+        ) -> ModifiedArticle:
+        filter_ids = (lambda clubid = None, articleid = None, **kwargs: kwargs)
+        data = [filter_ids(**article) for article in articles]
+        new_article: ModifiedArticle = self.write_article(data, "modify", verbose, dry_run)
+        if isinstance(new_article.get("origin"), int):
+            origin = articles[new_article["origin"]]
+            self.original_articles.add((origin["clubid"], origin["articleid"]))
+        return new_article
+
+    ############################# <start> #############################
+    ############################ Read Loop ############################
+
+    def read_loop(
+            self,
+            max_steps: int = 100,
+            max_read_length: int = 500,
+            reload_start_step: int = 10,
+            verbose: int | str | Path = 0,
+        ) -> list[ArticleIdInfo]:
         articles, step, unselected_steps = list(), 1, 0
+        self.config.reset_counter("read")
+        src_read_ids = set()
 
         for step in range(1, max_steps+1):
             self.check_quiet_hours()
 
-            if not self.has_next_action():
+            if step > reload_start_step:
+                wait(self.delays.reload)
+                reload_articles(self.page, self.delays.goto)
+            elif step > 2:
+                next_articles(self.page, self.delays.action)
+
+            selected = explore_articles(
+                self.page, src_read_ids, self.get_prompt("sample_articles", "src"), verbose) # Action 3
+            self.log.read_ids["src"].update(src_read_ids)
+            for params in selected:
+                self.check_quiet_hours()
+                if (params["clubid"], params["articleid"]) in self.original_articles:
+                    continue
+
+                if goto_article(self.page, params["articleid"], self.delays.goto): # Action 4
+                    try:
+                        article = self.read_full_article(max_read_length, verbose) # Action 5
+                        if article:
+                            articles.append(dict(article, clubid=params["clubid"], articleid=params["articleid"]))
+                            self.log.read_articles.append(article)
+                    finally:
+                        go_back(self.page, self.delays.goto)
+
+                if self.config.counter["read"] < 1:
+                    return articles
+
+            read_ids = ','.join([param["articleid"] for param in selected])
+            self.print_loop("read_loop_end", step, verbose, read_ids=read_ids)
+
+            if (step > reload_start_step) and (not selected):
+                wait(max(10, (unselected_steps := unselected_steps + 1)))
+            else:
+                unselected_steps = 0
+
+            self.log.total_steps += 1
+
+        return articles
+
+    ############################# Action 5 ############################
+
+    def read_full_article(self, max_read_length: int = 500, verbose: int | str | Path = 0) -> ArticleInfo | None:
+        contents = read_article(self.page, contents_only=True)
+        if contents["word_count"] > max_read_length:
+            return None
+        elif len(contents["lines"]) < self.config.limit["min_line"]:
+            return None
+        elif len([content for content in contents["lines"] if content.startswith("![")]) != 0:
+            return None
+        else:
+            article = read_full_article(self.page, self.delays.action, self.wpm["src"], verbose)
+            self.config.sub_counter("read")
+            return article
+
+    ############################ Read Loop ############################
+    ############################## <end> ##############################
+
+    ############################# <start> #############################
+    ########################## Reaction Loop ##########################
+
+    def action_loop(
+            self,
+            max_steps: int = 100,
+            is_article_allowed: bool = False,
+            max_read_length: int = 500,
+            reload_start_step: int = 10,
+            verbose: int | str | Path = 0,
+            dry_run: bool = False,
+        ):
+        articles, step, unselected_steps = list(), 1, 0
+        self.config.reset_counter("read")
+
+        for step in range(1, max_steps+1):
+            self.check_quiet_hours()
+
+            if not self.has_next_action(is_article_allowed):
                 break
 
             if step > reload_start_step:
@@ -537,25 +779,23 @@ class Farmer(BrowserController):
                 next_articles(self.page, self.delays.action)
 
             selected = explore_articles(
-                self.page, self.log.read_ids, self.get_prompt("select_articles"), verbose) # Action 3 + Agent 1
+                self.page, self.log.read_ids["dst"], self.get_prompt("select_articles", "dst"), verbose) # Action 3
             for params in selected:
                 self.check_quiet_hours()
 
                 if goto_article(self.page, params["articleid"], self.delays.goto): # Action 4
                     try:
-                        activity = self.read_and_react(max_read_length, wait_until_read, verbose, dry_run)
+                        activity = self.read_and_react(max_read_length, verbose, dry_run)
                         if activity:
                             articles.append({key: activity[key] for key in ["title","contents","comments","created_at"]})
-                            self.log.read_articles.append(activity)
                     finally:
                         go_back(self.page, self.delays.goto)
 
-                if self.is_article_allowed():
-                    new_article = self.write_article(articles, verbose, dry_run)
-                    self.log.written_articles.append(new_article)
+                if is_article_allowed and self.is_article_allowed():
+                    self.write_article(articles, "create", verbose, dry_run)
 
             read_ids = ','.join([param["articleid"] for param in selected])
-            self.print_loop(step, verbose, read_ids=read_ids)
+            self.print_loop("action_loop_end", step, verbose, read_ids=read_ids)
 
             if (step > reload_start_step) and (not selected):
                 wait(max(10, (unselected_steps := unselected_steps + 1)))
@@ -564,82 +804,107 @@ class Farmer(BrowserController):
 
             self.log.total_steps += 1
 
-    def get_prompt(self, file_name: str) -> dict:
-        cafe_root = os.path.join(PROMPTS_ROOT, self.config.cafe_name)
-        cafe_menu_root = os.path.join(cafe_root, self.config.menu_name)
+    def get_prompt(self, file_name: str, target: Literal["dst","src"] = "dst", **replacements: str) -> dict:
+        dst, src = self.config.cafe.dst, self.config.cafe.src
+        replacements = dict(replacements, dst_cafe=dst.name, dst_menu=dst.menu, src_cafe=src.name, src_menu=src.menu)
+
+        cafe = src if target == "src" else dst
+        cafe_root = os.path.join(PROMPTS_ROOT, cafe.name)
+        cafe_menu_root = os.path.join(cafe_root, cafe.menu)
+
         for root in [cafe_menu_root, cafe_root, PROMPTS_ROOT]:
             markdown_path = os.path.join(root, f"{file_name}.md")
             if os.path.exists(markdown_path):
-                return dict(markdown_path=markdown_path)
+                return dict(markdown_path=markdown_path, replacements=replacements)
         raise PromptNotFoundError(f"'{file_name}' 프롬프트가 존재하지 않습니다.")
 
     ########################### Action 0+1+2 ##########################
 
-    def navigate_to_menu(self, has_state: bool = True):
-        if has_state:
+    def navigate_to_menu(
+            self,
+            has_state: bool = True,
+            referer: Literal["cafe"] | None = None,
+            target: Literal["dst","src"] = "dst",
+        ):
+        if referer == "cafe":
+            return_to_cafe_home(self.page, self.mobile, self.delays.goto)
+        elif has_state:
             goto_cafe_home(self.page, self.mobile, **self.delays2) # Action 0
         else:
             login(self.page, self.config.userid, self.config.passwd, "cafe", self.mobile, **self.delays2)
         wait(self.delays.goto)
 
-        goto_cafe(self.page, self.config.cafe_name, self.delays.goto), wait(self.delays.goto) # Action 1
-        self.timer.start_timer("visit")
-        goto_menu(self.page, self.config.menu_name, **self.delays2), wait(self.delays.goto) # Action 2
+        cafe = self.config.cafe.src if target == "src" else self.config.cafe.dst
+        goto_cafe(self.page, cafe.name, self.delays.goto), wait(self.delays.goto) # Action 1
+        self.config.timer.start_timer("visit")
+        goto_menu(self.page, cafe.menu, **self.delays2), wait(self.delays.goto) # Action 2
 
     ############################# Action 9 ############################
 
-    def check_member_level(self) -> bool:
+    def check_action_log(self, total_only: bool = False) -> bool:
         qualified = True
-        action_log = read_action_log(self.page, **self.delays2)
+        action_log = read_action_log(self.page, total_only, **self.delays2)
+        total, today = action_log["total"], action_log["today"]
 
-        if "방문" in action_log:
-            self.log.visit_count = action_log["방문"]
-            if self.config.limit["visit"]:
-                qualified &= (self.config.limit["visit"] <= action_log["방문"])
+        self.config.log.user_info["total"] = total
 
-        if "작성글" in action_log:
-            self.log.article_count = action_log["작성글"]
+        for key, count in action_log["total"].items():
+            if self.config.limit.get(key):
+                qualified &= (self.config.limit[key] <= count)
 
-        if "댓글" in action_log:
-            self.log.comment_count = action_log["댓글"]
-            if self.config.limit["comment"]:
-                qualified &= (self.config.limit["comment"] <= action_log["댓글"])
+        if not total_only:
+            self.config.log.user_info["today"] = today
+            for key in ["article","comment"]:
+                daily_limit = self.config.limit[f"daily_{key}"]
+                if daily_limit and (daily_limit < today[key]):
+                    self.config.zero_counter(key)
+                if key not in self.config.timer:
+                    self.config.timer.set_timer(key, today[f"last_{key}_ts"])
 
         return qualified
 
     def read_my_articles(self, n: int = 10) -> list[ArticleInfo]:
         open_info(self.page, **self.delays2)
         try:
-            return read_my_articles(self.page, self.delays.goto, n, wait_until_read=False) # Action 9
+            return read_my_articles(self.page, self.delays.goto, n) # Action 9
         finally:
             close_info(self.page, self.delays.goto)
 
     ######################### Action Condition ########################
 
-    def has_next_action(self) -> bool:
-        return ((self.config.counter["like"] > 0)
-            or ((self.config.counter["comment"] > 0)
-                and self.timer.gte("comment", self.config.delay["comment"]))
-            or ((self.config.counter["article"] > 0)
-                and self.timer.gte("article", self.config.delay["article"])))
+    def has_next_action(self, is_article_allowed: bool = False) -> bool:
+        return (self.has_next_like()
+            or self.has_next_comment()
+            or (is_article_allowed and self.has_next_article()))
 
-    def is_comment_allowed(self) -> bool:
-        return ((self.config.counter["comment"] > 0)
-            and self.timer.gte("comment", self.config.delay["comment"])
-            and (random.uniform(0, 1) > self.threshold.comment))
+    def has_next_article(self) -> bool:
+        if self.config.limit["daily_article"] < self.config.log.user_info["today"]["article"]:
+            self.config.zero_counter("article")
+        return ((self.config.counter["article"] > 0)
+            and self.config.timer.gte("article", self.config.delay["article"]))
 
     def is_article_allowed(self) -> bool:
-        return ((self.config.counter["read"] < 1)
-            and (self.config.counter["article"] > 0)
-            and self.timer.gte("article", self.config.delay["article"]))
+        return ((self.config.counter["read"] < 1) and self.has_next_article())
+
+    def has_next_comment(self) -> bool:
+        if self.config.limit["daily_comment"] < self.config.log.user_info["today"]["comment"]:
+            self.config.zero_counter("comment")
+        return ((self.config.counter["comment"] > 0)
+            and self.config.timer.gte("comment", self.config.delay["comment"]))
+
+    def is_comment_allowed(self) -> bool:
+        return (self.has_next_comment() and (random.uniform(0, 1) > self.threshold.comment))
+
+    def has_next_like(self) -> bool:
+        return (self.config.counter["like"] > 0)
 
     def is_like_allowed(self) -> bool:
-        return (self.config.counter["like"] > 0) and (random.uniform(0, 1) > self.threshold.like)
+        return (self.has_next_like() and (random.uniform(0, 1) > self.threshold.like))
 
     def need_my_articles(self, num_my_articles: int = 10) -> bool:
         return ((num_my_articles > 0)
             and (self.config.counter["article"] > 0)
-            and (self.log.article_count > 0)
+            and (self.log.user_info["total"]["article"] > 0)
             and (not self.log.my_articles))
 
     ########################### Action 5+6+7 ##########################
@@ -647,28 +912,27 @@ class Farmer(BrowserController):
     def read_and_react(
             self,
             max_read_length: int = 500,
-            wait_until_read: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
         ) -> ArticleActivity | None:
-        word_count = read_article(self.page, wait_until_read=False, contents_only=True)["word_count"]
+        word_count = read_article(self.page, contents_only=True)["word_count"]
         if word_count > max_read_length:
             return None
         else:
             comment: Comment = None
-            common = dict(page=self.page, wait_until_read=wait_until_read, verbose=verbose)
+            common = dict(page=self.page, wpm=self.wpm["dst"], verbose=verbose)
 
         if self.is_comment_allowed():
             article, comment = read_article_and_write_comment(
                 **common,
-                comment_limit = (self.config.length["comment"] or "20자 이내"),
-                prompt = self.get_prompt("create_comment"),
+                prompt = self.get_prompt("create_comment", "dst",
+                    comment_limit = (self.config.length.get("comment") or "20자 이내")),
                 dry_run = dry_run,
                 **self.delays3,
             ) # Action 5+7 & Agent 2
             if comment:
                 self.config.sub_counter("comment")
-                self.timer.start_timer("comment")
+                self.config.timer.start_timer("comment")
         else:
             article = read_full_article(**common, action_delay=self.delays.action) # Action 5
         self.config.sub_counter("read")
@@ -682,6 +946,8 @@ class Farmer(BrowserController):
         else:
             article["like_this"] = False
 
+        self.log.read_articles.append(article)
+
         return article
 
     ############################# Action 8 ############################
@@ -689,26 +955,33 @@ class Farmer(BrowserController):
     def write_article(
             self,
             articles: list[ArticleInfo],
+            action: Literal["create","modify"] = "create",
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             update: bool = True,
-        ) -> NewArticle:
+        ) -> NewArticle | ModifiedArticle:
         info, new = dict(title=str(), contents=list(), comments=list(), created_at=str()), dict()
+
+        replacements = dict()
+        if action == "create":
+            replacements = dict(
+                title_limit = (self.config.length.get("title") or "30자 이내"),
+                contents_limit = (self.config.length.get("contents") or "300자 이내"),
+            )
+
         try:
-            new = write_article(
+            new = (update_article if action == "modify" else write_article)(
                 page = self.page,
                 articles = articles,
                 my_articles = self.log.my_articles,
-                title_limit = (self.config.length["title"] or "30자 이내"),
-                contents_limit = (self.config.length["contents"] or "300자 이내"),
-                prompt = self.get_prompt("create_article"),
+                prompt = self.get_prompt(f"{action}_article", "dst", **replacements),
                 verbose = verbose,
                 dry_run = dry_run,
                 **self.delays3,
             ) # Action 8
         finally:
             go_back(self.page, self.delays.goto)
-        self.timer.start_timer("article")
+        self.config.timer.start_timer("article")
 
         self.config.reset_counter("read")
         self.config.sub_counter("article")
@@ -720,8 +993,37 @@ class Farmer(BrowserController):
             self.log.my_articles.appendleft(info)
         return new
 
-    ########################### Action Loop ###########################
+    ########################## Reaction Loop ##########################
     ############################## <end> ##############################
+
+    ############################ Action 10 ############################
+
+    def reply_my_articles(
+            self,
+            cutoff_date: dt.date | None = None,
+            max_reply_length: int = 100,
+            verbose: int | str | Path = 0,
+            dry_run: bool = False,
+        ) -> list[Replies]:
+        replies = list()
+
+        open_info(self.page, **self.delays2)
+        try:
+            replies = reply_my_articles(
+                page = self.page,
+                cutoff_date = (cutoff_date if isinstance(cutoff_date, dt.date) else dt.date.today()),
+                max_reply_length = max_reply_length,
+                **self.delays3,
+                prompt = self.get_prompt("create_replies", "dst"),
+                verbose = verbose,
+                dry_run = dry_run,
+            )
+        finally:
+            close_info(self.page, self.delays.goto)
+
+        if replies:
+            self.log.written_replies += replies
+        return replies
 
     ############################ Task Loop ############################
     ############################## <end> ##############################
@@ -758,11 +1060,14 @@ class Farmer(BrowserController):
             else:
                 return "네이버 로그인 오류"
         elif isinstance(error, CafeNotFound):
-            return "가입카페 확인 불가"
+            cafe_name = match.group(1) if (match := re.search(r"'([^']+)'", str(error))) else "확인불가"
+            return f"카페 비회원: {cafe_name}"
         elif isinstance(error, CafeBannedError):
             return "카페 활동정지"
         elif isinstance(error, MaxLoopExceeded):
             return "반복 횟수 초과"
+        elif isinstance(error, PromptNotFoundError):
+            return "프롬프트 없음"
         elif isinstance(error, QuietHoursError):
             return "금지 시간대"
         elif isinstance(error, TimeoutError):
@@ -773,6 +1078,7 @@ class Farmer(BrowserController):
     def handle_error_flag(self, flag: ErrorFlag) -> StopTask:
         if not isinstance(flag, str):
             return False
+
         elif flag == "VPN 사용중":
             try:
                 self.vpn.restart_service(**self.vpn_config.login)
@@ -780,6 +1086,7 @@ class Farmer(BrowserController):
                 return False
             except Exception:
                 return True
+
         elif flag.startswith("네이버"):
             userid = self.config.userid
             for config in self.configs:
@@ -788,53 +1095,67 @@ class Farmer(BrowserController):
             if (state := self.browser_state) and state.exists():
                 os.remove(str(state))
             return False
-        elif flag in {"가입카페 확인 불가", "카페 활동정지"}:
-            userid, cafe_name = self.config.userid, self.config.cafe_name
+
+        elif flag.startswith("카페 비회원"):
+            userid = self.config.userid
+            dst, src = self.config.cafe.dst.name, self.config.cafe.src.name
+            cafe_name = flag.split(": ")[1]
+            cafes = {dst, src} if cafe_name == "확인불가" else ({dst} if dst == cafe_name else {src})
+
             for config in self.configs:
-                if (config.userid == userid) and (config.cafe_name == cafe_name):
+                if ((config.userid == userid)
+                    and ((config.cafe.dst.name in cafes) or (config.cafe.src.name in cafes))):
                     config.zero_counter("all")
             return False
+
+        elif flag == "카페 활동정지":
+            userid, cafe_name = self.config.userid, self.config.cafe.dst
+            for config in self.configs:
+                if (config.userid == userid) and (config.cafe.dst == cafe_name):
+                    config.zero_counter("all")
+            return False
+
         else:
-            return flag.startswith("VPN") or (flag == "금지 시간대")
+            return flag.startswith("VPN") or (flag in {"프롬프트 없음", "금지 시간대"})
 
     ############################# Task Log ############################
 
-    def print_loop(
-            self,
-            step: int | Literal["start","end","break","wait"],
-            verbose: int | str | Path = 0,
-            **kwargs
-        ):
+    def print_loop(self, task_step: str, loop_step: int, verbose: int | str | Path = 0, **kwargs):
         common = lambda: dict(
             index = self.index,
             userid = self.config.userid,
-            cafe_name = self.config.cafe_name,
-            menu_name = self.config.menu_name,
+            cafe_name = (self.config.cafe.src if task_step == "read_loop_end" else self.config.cafe.dst).name,
+            menu_name = (self.config.cafe.src if task_step == "read_loop_end" else self.config.cafe.dst).menu,
         )
 
-        if isinstance(step, int):
+        if task_step in {"action_loop_end", "read_loop_end"}:
             body = dict(
-                task_step = f"loop_{step}",
+                task_step = task_step,
+                loop_step = loop_step,
                 **common(),
                 read_ids = str(read_ids) if (read_ids := kwargs.get("read_ids")) else None,
                 counter = self.config.counter,
-                timer = self.timer.get_all_elapsed_times(ndigits=3),
+                timer = self.config.timer.get_all_elapsed_times(ndigits=3),
             )
-        elif step == "start":
+        elif task_step == "task_loop_start":
             body = dict(
-                task_step = "loop_start",
+                task_step = task_step,
+                loop_step = loop_step,
                 **common(),
-                config = self.config,
+                config = self.config.public_items(),
                 state = str(state) if (state := kwargs.get("state")) else None,
             )
-        elif step == "wait":
+        elif task_step == "task_loop_wait":
             body = dict(
-                task_step = "loop_wait",
+                task_step = task_step,
+                loop_step = loop_step,
                 seconds = kwargs.get("seconds"),
+                timers = {i: config.timer.get_all_elapsed_times() for i, config in enumerate(self.configs)},
             )
         else:
             body = dict(
-                task_step = f"loop_{step}",
+                task_step = task_step,
+                loop_step = loop_step,
                 **common(),
                 log = self.log.to_json(ellipsis_list=((not isinstance(verbose, int)) or (verbose < 3))),
             )
@@ -859,7 +1180,7 @@ class Farmer(BrowserController):
         client = WorksheetClient(self._get_credentials(account), key, sheet, head)
         str_keys = [i for i, type in enumerate(get_type_hints(Config).values(), start=1) if type == str]
         records = client.get_all_records(numericise_ignore=str_keys)
-        return [ConfigWrapper(record) for record in records if isinstance(record["row_no"], int)]
+        return [ConfigWrapper(record) for record in records if isinstance(record["no"], int)]
 
     def write_log_table_to_gsheets(
             self,
@@ -874,24 +1195,27 @@ class Farmer(BrowserController):
 
     def make_log_table(self) -> list[LogTableRow]:
         rows = list()
-        for index, log in self.logs.items():
-            config = self.configs[index]
+        for config in self.configs:
+            log = config.log
             rows.append(dict(
-                row_no = config.row_no,
+                no = config.no,
                 userid = config.userid,
-                cafe_name = config.cafe_name,
-                menu_name = config.menu_name,
+                cafe_name = config.cafe.dst.name,
+                menu_name = config.cafe.dst.menu,
                 ip_addr = config.ip_addr,
                 last_active_ts = log.last_active_ts,
-                time_on_cafe = log.time_on_cafe,
-                visit_count = log.visit_count,
-                article_count = log.article_count,
-                comment_count = log.comment_count,
-                read_ids = ','.join(sorted(log.read_ids)) or None,
+                time_on_cafe = seconds_to_mmss(log.time_on_cafe) if isinstance(log.time_on_cafe, float) else None,
+                total_visit_count = log.user_info["total"].get("visit"),
+                total_article_count = log.user_info["total"].get("article"),
+                total_comment_count = log.user_info["total"].get("comment"),
+                today_article_count = log.user_info["today"].get("article"),
+                today_comment_count = log.user_info["today"].get("comment"),
+                read_ids = ','.join(sorted(log.read_ids["dst"].union(log.read_ids["src"]))) or None,
                 read_articles = len(log.read_articles),
                 new_article_count = len(log.written_articles),
-                new_comment_count = len([1 for activity in log.read_articles if activity["written_comment"]]),
-                new_like_count = len([1 for activity in log.read_articles if activity["like_this"]]),
+                new_comment_count = len([1 for activity in log.read_articles if activity.get("written_comment")]),
+                new_reply_count = sum([len(replies["replies"]) for replies in log.written_replies]),
+                new_like_count = len([1 for activity in log.read_articles if activity.get("like_this")]),
                 total_steps = log.total_steps,
                 error_flag = log.error["flag"] if log.error else None,
             ))

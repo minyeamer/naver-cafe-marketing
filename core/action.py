@@ -4,10 +4,12 @@ from playwright.sync_api import Page, Locator
 
 from core.agent import Prompt4, Prompt5
 from core.agent import ArticleParams, select_articles
-from core.agent import ArticleInfo, create_comment
+from core.agent import ArticleInfo, create_comment, create_replies
 from core.agent import NewArticle, create_article
+from core.agent import ModifiedArticle, modify_article
 
 from utils.common import print_json, wait, Delay
+from utils.date import to_iso_date, to_iso_date_str, to_iso_datetime, to_iso_datetime_str
 from utils.locator import Overlay, locate, locate_all
 from utils.locator import is_visible, range_boundaries
 from utils.mouse import safe_wheel
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 MenuName = TypeVar("MenuName", bound=str)
+CafeId = TypeVar("CafeId", bound=str)
 ArticleId = TypeVar("ArticleId", bound=str)
 Comment = TypeVar("Comment", bound=str)
 
@@ -41,38 +44,41 @@ class Contents(TypedDict):
     read_end: int
     read_done: bool
 
+class Replies(TypedDict):
+    title: str
+    contents: list[str]
+    comments: list[str]
+    replies: list[str]
+    created_at: str
+
+class Wpm(TypedDict):
+    kor: int
+    eng: int
+    img: int
+    wait: bool
+
+
+class TotalCount(TypedDict):
+    visit: int
+    article: int
+    comment: int
+
+class TodayCount(TypedDict):
+    article: int
+    last_article_ts: dt.datetime
+    comment: int
+    last_comment_ts: dt.datetime
+
+class ActionLog(TypedDict):
+    total: TotalCount
+    today: TodayCount
+
 
 class CafeNotFound(RuntimeError):
     ...
 
 class CafeBannedError(RuntimeError):
     ...
-
-
-def cur_time() -> str:
-    return dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
-
-
-def _to_iso_date(text: str) -> str:
-    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\.)", text)):
-        try:
-            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d.")
-            return datetime.strftime("%Y-%m-%d") + "T00:00:00+09:00"
-        except:
-            return cur_time()
-    else:
-        return cur_time()
-
-
-def _to_iso_datetime(text: str) -> str:
-    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\. \d{2}:\d{2})", text)):
-        try:
-            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d. %H:%M")
-            return datetime.strftime("%Y-%m-%dT%H:%M") + ":00+09:00"
-        except:
-            return cur_time()
-    else:
-        return cur_time()
 
 
 ###################################################################
@@ -86,7 +92,7 @@ def goto_cafe_home(
         goto_delay: Delay = (1, 3),
     ):
     """## Action 0"""
-    if page.url == cafe_url(mobile):
+    if page.url.startswith(cafe_url(mobile)):
         return
     goto_naver_main(page, mobile, goto_delay)
 
@@ -100,6 +106,14 @@ def goto_cafe_home(
         # :has(a[href="https://cafe.naver.com"][target="_blank"])
         # from ncafe.utils.desktop import click_new_page
         # click_new_page(context, page, '[href="https://cafe.naver.com"]')
+
+
+def return_to_cafe_home(page: Page, mobile: bool = True, goto_delay: Delay = (1, 3)):
+    selector = f'[href="{cafe_url(mobile)}"]'
+    if mobile:
+        page.locator(selector).tap(), wait(goto_delay)
+    else:
+        page.locator(selector).click(), wait(goto_delay)
 
 
 def goto_naver_main(
@@ -117,16 +131,16 @@ def main_url(mobile: bool) -> str:
 
 def cafe_url(mobile: bool) -> str:
     if mobile:
-        return "https://m.cafe.naver.com/"
+        return "https://m.cafe.naver.com"
     else:
-        return "https://section.cafe.naver.com/ca-fe/home"
+        return "https://section.cafe.naver.com"
 
 
 ###################################################################
 ###################### Action 1 - :goto_cafe: #####################
 ###################################################################
 
-def goto_cafe(page: Page, cafe_name: str, goto_delay: Delay = (1, 3)):
+def goto_cafe(page: Page, cafe_name: str, goto_delay: Delay = (1, 3), timeout: float = 10000):
     """## Action 1"""
     try:
         locate(page, 'a:has-text("내 카페")', nth=-1).tap()
@@ -135,9 +149,12 @@ def goto_cafe(page: Page, cafe_name: str, goto_delay: Delay = (1, 3)):
     wait(goto_delay)
 
     try:
-        page.locator(cafe_link := f'.cafe_info:has-text("{cafe_name}")').first
+        page.wait_for_selector(cafe_link := f'.cafe_info:has-text("{cafe_name}")', timeout=timeout)
     except Exception:
-        raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
+        if page.locator(".cafe_info").count() == 0:
+            page.locator(cafe_link).tap(timeout=1000)
+        else:
+            raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
 
     ranges = dict(
         boundary = page.locator("body").first,
@@ -278,7 +295,7 @@ def goto_article(page: Page, id: str | int | Literal["random"], goto_delay: Dela
 
 def read_article(
         page: Page,
-        wait_until_read: bool = True,
+        wpm: Wpm = dict(),
         verbose: int | str | Path = 0,
         contents_only: bool = False,
     ) -> ArticleInfo | Contents:
@@ -312,9 +329,9 @@ def read_article(
         read_end = total_lines - 1
     read_done = ((read_end + 1) == total_lines) if (total_lines > 0) and visible_lines else True
 
-    seconds = round(_estimate_reading_seconds(visible_lines), 1)
+    seconds = round(_estimate_reading_seconds(visible_lines, **wpm), 1)
     print_json({"action": "read_article", "reading_time": seconds}, verbose)
-    if wait_until_read:
+    if wpm.get("wait"):
         wait(max(seconds, 0.1))
 
     if contents_only:
@@ -328,18 +345,18 @@ def read_article(
 def read_full_article(
         page: Page,
         action_delay: Delay = (0.3, 0.6),
-        wait_until_read: bool = True,
+        wpm: Wpm = dict(),
         verbose: int | str | Path = 0,
         contents_only: bool = False,
         timeout: float = 30.,
     ) -> ArticleInfo | Contents:
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
-    contents = read_article(page, wait_until_read, verbose, contents_only=True)
+    contents = read_article(page, wpm, verbose, contents_only=True)
     read_start = contents["read_start"]
 
     while (not contents["read_done"]) and ((end_time() - start_time) < timeout):
         next_lines(page, action_delay)
-        contents = read_article(page, wait_until_read, verbose, contents_only=True)
+        contents = read_article(page, wpm, verbose, contents_only=True)
     if read_comments(page):
         ranges = get_cafe_ranges(page, header=True, tab=False)
         safe_wheel(page, target=page.locator(".CommonComment .write").first, **ranges), wait(action_delay)
@@ -356,7 +373,7 @@ def _make_article_info(page: Page, lines: list[str]) -> ArticleInfo:
         "title": page.locator(".post_title .tit").first.text_content().strip(),
         "contents": lines,
         "comments": read_comments(page),
-        "created_at": _to_iso_datetime(page.locator(".post_title .date").first.text_content().strip()),
+        "created_at": to_iso_datetime_str(page.locator(".post_title .date").first.text_content().strip()),
     }
 
 
@@ -374,14 +391,20 @@ def prev_lines(page: Page, action_delay: Delay = (0.3, 0.6)):
     wait(action_delay)
 
 
-def _estimate_reading_seconds(lines: Iterable[str], kor_cpm: int = 160, eng_cpm: int = 238) -> float:
-    seconds = 0.
+def _estimate_reading_seconds(
+        lines: Iterable[str],
+        kor: int = 160,
+        eng: int = 238,
+        img: int = 20,
+        **kwargs
+    ) -> float:
+    seconds, image_seconds = 0., (img / 60)
     for line in lines:
         if not line:
             continue
         elif line.startswith("![") and line.endswith(')'):
-            seconds += 3.
-        elif (cpm := _calc_weighted_cpm(line, kor_cpm, eng_cpm)):
+            seconds += image_seconds
+        elif (cpm := _calc_weighted_cpm(line, kor, eng)):
             total_chars = _count_hangul_chars(line) + _count_english_chars(line)
             seconds += round((total_chars / cpm) * 60, 5)
     return seconds
@@ -455,11 +478,10 @@ def read_comments(page: Page) -> list[str]:
 
 def read_article_and_write_comment(
         page: Page,
-        comment_limit: str = "20자 이내",
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         upload_delay: Delay = (2, 4),
-        wait_until_read: bool = True,
+        wpm: Wpm = dict(),
         prompt: Prompt5 = dict(),
         verbose: int | str | Path = 0,
         dry_run: bool = False,
@@ -468,11 +490,11 @@ def read_article_and_write_comment(
     ) -> tuple[ArticleInfo, Comment]:
     """## Action 5+7"""
     start_time, end_time = time.perf_counter(), (lambda: time.perf_counter())
-    contents = read_article(page, wait_until_read=False, verbose=verbose, contents_only=True)
+    contents = read_article(page, dict(wpm, **{"wait": False}), verbose, contents_only=True)
     article_info = _make_article_info(page, contents["lines"])
-    comment = create_comment(article_info, comment_limit, **prompt, verbose=verbose, **kwargs) # Agent 2
+    comment = create_comment(article_info, **prompt, verbose=verbose, **kwargs) # Agent 2
 
-    if wait_until_read:
+    if wpm.get("wait"):
         current_wait = round(_estimate_reading_seconds(contents["visible_lines"]), 1)
         creating_time = round(time.perf_counter() - start_time, 1)
         left_wait = current_wait - creating_time
@@ -481,7 +503,7 @@ def read_article_and_write_comment(
 
         while (not contents["read_done"]) and ((end_time() - start_time) < timeout):
             next_lines(page, action_delay)
-            contents = read_article(page, wait_until_read=True, verbose=verbose, contents_only=True)
+            contents = read_article(page, wpm, verbose, contents_only=True)
         if article_info["comments"]:
             ranges = get_cafe_ranges(page, header=True, tab=False)
             safe_wheel(page, target=page.locator(".CommonComment .write").first, **ranges), wait(action_delay)
@@ -499,8 +521,6 @@ def write_article(
         page: Page,
         articles: Iterable[ArticleInfo],
         my_articles: Iterable[str] = list(),
-        title_limit: str = "30자 이내",
-        contents_limit: str = "300자 이내",
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         upload_delay: Delay = (2, 4),
@@ -519,7 +539,10 @@ def write_article(
     except Exception:
         pass
 
-    article = create_article(articles, my_articles, title_limit, contents_limit, **prompt, verbose=verbose, **kwargs)
+    if kwargs.pop("agent_name", str()) == "modify_article":
+        article = modify_article(articles, my_articles, **prompt, verbose=verbose, **kwargs) # Agent 5
+    else:
+        article = create_article(articles, my_articles, **prompt, verbose=verbose, **kwargs) # Agent 4
 
     title_area = page.locator(".ArticleWriteFormSubject textarea").first
     title_area.tap(), wait(action_delay)
@@ -539,6 +562,23 @@ def write_article(
     return article
 
 
+def update_article(
+        page: Page,
+        articles: Iterable[ArticleInfo],
+        my_articles: Iterable[str] = list(),
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        upload_delay: Delay = (2, 4),
+        prompt: Prompt5 = dict(),
+        verbose: int | str | Path = 0,
+        dry_run: bool = False,
+        **kwargs
+    ) -> ModifiedArticle:
+    kwargs["agent_name"] = "modify_article"
+    return write_article(
+        page, articles, my_articles, action_delay, goto_delay, upload_delay, prompt, verbose, dry_run, **kwargs)
+
+
 ###################################################################
 ################## Action 9 - :read_my_articles: ##################
 ###################################################################
@@ -548,7 +588,7 @@ def read_my_articles(
         goto_delay: Delay = (1, 3),
         n_articles: int | None = None,
         read_articles: bool = True,
-        wait_until_read: bool = True,
+        wpm: Wpm = dict(),
         verbose: int | str | Path = 0,
     ) -> list[ArticleInfo]:
     """## Action 9"""
@@ -557,7 +597,7 @@ def read_my_articles(
         if read_articles:
             safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
             try:
-                data.append(read_article(page, wait_until_read, verbose, contents_only=False))
+                data.append(read_article(page, wpm, verbose, contents_only=False))
             finally:
                 go_back(page, goto_delay)
         else:
@@ -565,7 +605,7 @@ def read_my_articles(
                 "title": item.locator(".tit").text_content().strip(),
                 "contents": list(),
                 "comments": list(),
-                "created_at": _to_iso_date(item.locator(".time").text_content().strip()),
+                "created_at": to_iso_date_str(item.locator(".time").text_content().strip()),
             })
     return data
 
@@ -579,17 +619,65 @@ def close_info(page: Page, goto_delay: Delay = (1, 3)):
     page.tap('.HeaderGnbLeft [role="button"]'), wait(goto_delay)
 
 
-def read_action_log(page: Page, action_delay: Delay = (0.3, 0.6), goto_delay: Delay = (1, 3)) -> dict[str,int]:
+def read_action_log(
+        page: Page,
+        total_only: bool = False,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        today: dt.date | None = None,
+    ) -> ActionLog:
     open_menu(page, goto_delay)
-    def safe_int(value: str) -> int:
-        try: return int(value)
-        except: return
     try:
         keys = [span.text_content().strip() for span in locate_all(page, ".myinfo_detail .detail_title")]
-        values = [safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
-        return dict(zip(keys, values))
+        values = [_safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
+        alias = {"방문": "visit", "작성글": "article", "댓글": "comment"}
+        total_count: TotalCount = {alias[key]: value for key, value in zip(keys, values) if key in alias}
+        today_count: TodayCount = dict(article=0, last_article_ts=None, comment=0, last_comment_ts=None)
+
+        if total_only:
+            return dict(total=total_count, today=today_count)
+
+        try:
+            page.tap("header .info_link"), wait(goto_delay)
+            try:
+                today_count = _read_daily_log(page, today_count, goto_delay, today)
+            except Exception:
+                pass
+            finally:
+                close_info(page, goto_delay)
+        except Exception:
+            pass
+        return dict(total=total_count, today=today_count)
     finally:
         page.touchscreen.tap(0, 0), wait(action_delay)
+
+
+def _read_daily_log(
+        page: Page,
+        today_count: TodayCount,
+        goto_delay: Delay = (1, 3),
+        today: dt.date | None = None,
+    ) -> TodayCount:
+    today = today if isinstance(today, dt.date) else dt.date.today()
+    yesterday = dt.date.today() - dt.timedelta(days=1)
+
+    today_count["article"] = len([1 for item in locate_all(page, ".list_area .time")
+        if to_iso_date(item.text_content().strip(), default=yesterday).date() == today])
+
+    if today_count["article"] > 0:
+        safe_tap(page, ".list_area .txt_area", **_get_info_ranges(page)), wait(goto_delay)
+        today_count["last_article_ts"] = to_iso_datetime(page.locator(".post_title .date").first.text_content().strip())
+        go_back(page, goto_delay)
+
+    page.locator('.tab_menu:has-text("작성댓글")').tap(), wait(goto_delay)
+
+    comments = [ts for item in locate_all(page, ".comment_item .date")
+        if (ts := to_iso_datetime(item.text_content().strip(), default=yesterday)).date() == today]
+    today_count["comment"] = len(comments)
+    if today_count["comment"] > 0:
+        today_count["last_comment_ts"] = max(comments)
+
+    return today_count
 
 
 def _get_info_ranges(page: Page) -> CafeRanges:
@@ -601,3 +689,94 @@ def _get_info_ranges(page: Page) -> CafeRanges:
 
 def _get_info_overlay(page: Page) -> Overlay:
     return dict(top = page.locator(".HeaderWrap").first.bounding_box()["height"])
+
+
+def _safe_int(value: str) -> int:
+    try: return int(value)
+    except: return
+
+
+###################################################################
+################# Action 10 - :reply_my_articles: #################
+###################################################################
+
+def reply_my_articles(
+        page: Page,
+        cutoff_date: dt.date | None = None,
+        max_reply_length: int = 100,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        upload_delay: Delay = (2, 4),
+        n_articles: int | None = None,
+        prompt: Prompt5 = dict(),
+        verbose: int | str | Path = 0,
+        dry_run: bool = False,
+        **kwargs
+    ) -> list[Replies]:
+    """## Action 9"""
+    if not isinstance(cutoff_date, dt.date):
+        return list()
+    data = list()
+
+    default = cutoff_date - dt.timedelta(days=1)
+    for item in locate_all(page, ".list_area .txt_area")[:n_articles]:
+        if cutoff_date <= to_iso_date(item.locator(".time").text_content().strip(), default=default).date():
+            safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
+            try:
+                args = (max_reply_length, action_delay, goto_delay, upload_delay, prompt, verbose, dry_run)
+                data.append(reply_comments(page, *args, **kwargs))
+            finally:
+                go_back(page, goto_delay)
+        else:
+            break
+    return data
+
+
+def reply_comments(
+        page: Page,
+        max_reply_length: int = 100,
+        action_delay: Delay = (0.3, 0.6),
+        goto_delay: Delay = (1, 3),
+        upload_delay: Delay = (2, 4),
+        prompt: Prompt5 = dict(),
+        verbose: int | str | Path = 0,
+        dry_run: bool = False,
+        **kwargs
+    ) -> Replies:
+    article_info = read_article(page, contents_only=False)
+
+    page.locator(".right_area .f_reply").first.tap(), wait(goto_delay)
+    try:
+        comments, replies = _catch_comments_without_replies(page, max_reply_length), list()
+        if comments:
+            article_info["comments"] = list(comments.values())
+            replies = create_replies(article_info, **prompt, verbose=verbose, **kwargs) # Agent 3
+
+            comment_areas = locate_all(page, ".comment_list li")
+            for comment_area, reply in zip([comment_areas[i] for i in comments.keys()], replies):
+                comment_area.locator(".btn_write").first.tap()
+                comment_area.locator(".textarea_write").first.tap(), wait(action_delay)
+                comment_area.locator(".text_input_area").first.type(reply, delay=100), wait(action_delay)
+                if not dry_run:
+                    comment_area.locator(".btn_area > button", has_text="등록").tap()
+                wait(upload_delay)
+
+        article_info["replies"] = replies
+        return article_info
+    finally:
+        go_back(page, goto_delay)
+
+
+def _catch_comments_without_replies(page: Page, max_length: int = 100) -> dict[int, Comment]:
+    comments = locate_all(page, ".comment_list li")
+    target, targets = 0, dict()
+    for i, comment in enumerate(comments, start=1):
+        if "reply" in comment.get_attribute("class"):
+            target = 0
+        else:
+            if target and len(comment := comments[target-1].locator(".txt").first.text_content()) <= max_length:
+                targets[target-1] = comment
+            target = i
+    if target and len(comment := comments[target-1].locator(".txt").first.text_content()) <= max_length:
+        targets[target-1] = comment
+    return targets
