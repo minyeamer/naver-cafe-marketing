@@ -38,14 +38,14 @@ def login(
     login_action(page, userid, passwd, mobile, action_delay, goto_delay)
 
     success_url = cafe_url(mobile) if referer == "cafe" else main_url(mobile)
-    if get_page_url(page).startswith(success_url):
+    if not get_page_url(page).startswith(success_url):
         if page.locator("#error_message").count() > 0:
+            if page.locator("#rcapt").count() > 0:
+                raise ReCaptchaRequiredError("자동입력 방지 문자를 입력해주세요.")
             message = page.locator("#error_message").first.text_content().strip()
             raise NaverLoginFailedError(message)
         elif page.locator("#divWarning").count() > 0:
             raise WarningAccountError("회원님의 아이디를 보호하고 있습니다.")
-        elif page.locator("#rcapt").count() > 0:
-            raise ReCaptchaRequiredError("자동입력 방지 문자를 입력해주세요.")
     goto_cafe_home(page, mobile, action_delay, goto_delay) # Action 0
 
 

@@ -284,7 +284,8 @@ class ArticleActivity(TypedDict):
 ErrorFlag = Literal[
     "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
-    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대", "브라우저 조작 오류"]
+    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대",
+    "브라우저 조작 오류", "알 수 없는 오류"]
 
 class ErrorLog(TypedDict):
     type: str
@@ -526,7 +527,7 @@ class Farmer(BrowserController):
             save_log: bool = True,
         ) -> StopTask:
         stop_task, flag = False, None
-        max_vpn_retries = max_retries.get("vpn_connect") or 5
+        max_vpn_retries = max_retries.get("vpn_connect") or 10
 
         for i in range(len(self.configs)):
             self.index = i
@@ -552,11 +553,9 @@ class Farmer(BrowserController):
                     self.do_actions(
                         max_retries, num_my_articles, max_read_length, max_reply_length,
                         reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
-                    self.log.error = None
                 finally:
                     if vpn_connected:
                         self.vpn.disconnect(**self.vpn_config.wait_options)
-                        self.vpn.logout(**self.vpn_config.wait_options)
             except Exception as error:
                 self.log.error = dict(
                     type = str(type(error).__name__),
@@ -566,7 +565,7 @@ class Farmer(BrowserController):
                 )
 
             self.log.last_active_ts = dt.datetime.now()
-            self.log.time_on_cafe = self.config.timer.end_timer("visit", 3)
+            self.log.time_on_cafe = (self.log.time_on_cafe or 0.) + self.config.timer.end_timer("visit", 3)
             self.print_loop("task_loop_end", loop_step, verbose)
 
             if save_log:
@@ -1036,7 +1035,7 @@ class Farmer(BrowserController):
         except:
             return None
 
-    def get_error_flag(self, error: Exception) -> ErrorFlag | None:
+    def get_error_flag(self, error: Exception) -> ErrorFlag:
         if isinstance(error, VpnRuntimeError):
             if isinstance(error, VpnLoginFailedError):
                 return "VPN 로그인 오류"
@@ -1073,7 +1072,7 @@ class Farmer(BrowserController):
         elif isinstance(error, TimeoutError):
             return "브라우저 조작 오류"
         else:
-            return None
+            return "알 수 없는 오류"
 
     def handle_error_flag(self, flag: ErrorFlag) -> StopTask:
         if not isinstance(flag, str):
@@ -1253,13 +1252,19 @@ class Farmer(BrowserController):
             self.vpn_config = None
             self.vpn_enabled = False
 
-    def ensure_vpn_connected(self, ip_addr: str, max_vpn_retries: int = 5, vpn_delay: float = 5.) -> bool:
+    def ensure_vpn_connected(self, ip_addr: str, max_vpn_retries: int = 10, vpn_delay: float = 5.) -> bool:
         for step in range(1, max_vpn_retries+1):
             try:
+                self.vpn.start_process(force_restart=False)
                 self.vpn.try_login(**self.vpn_config.login)
                 if self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect):
                     return True
+            except VpnInUseError as error:
+                raise error
             except Exception:
-                self.vpn.start_process(force_restart=True)
-                wait(vpn_delay * step)
+                try:
+                    self.vpn.terminate_process()
+                except:
+                    pass
+            wait(vpn_delay * step)
         raise VpnFailedError("VPN이 연결되지 않았습니다.")
