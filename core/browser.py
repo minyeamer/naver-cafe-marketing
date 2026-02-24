@@ -72,7 +72,7 @@ class BrowserState(AttrDict):
         if device:
             kwargs.update(self.__playwright.devices[device])
         if state and os.path.exists(str(state)):
-            kwargs.update(storage_state=state)
+            kwargs.update(storage_state=str(state))
         self.__context = self.__browser.new_context(**kwargs)
 
     def new_page(self):

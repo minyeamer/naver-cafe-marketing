@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from core.browser import BrowserController
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from core.login import login, NaverLoginError
 from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
@@ -73,6 +74,7 @@ class QuietHoursError(RuntimeError):
 
 class MaxRetries(TypedDict, total=False):
     task_loop: int
+    task_error: int
     action_loop: int
     read_loop: int
     vpn_connect: int
@@ -285,7 +287,7 @@ ErrorFlag = Literal[
     "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
     "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대",
-    "브라우저 조작 오류", "알 수 없는 오류"]
+    "브라우저 조작 오류", "알 수 없는 오류", "오류 횟수 초과"]
 
 class ErrorLog(TypedDict):
     type: str
@@ -313,7 +315,7 @@ class TaskLog(AttrDict):
         self.written_articles: list[NewArticle] = list()
         self.written_replies: list[Replies] = list()
         self.total_steps: int = 0
-        self.error: ErrorLog | None = None
+        self.errors: list[ErrorLog] = list()
 
     def to_json(self, ellipsis_list: bool = False) -> dict:
         def serialize(kv: tuple[str, Any]) -> tuple[str, Any]:
@@ -423,10 +425,10 @@ class Farmer(BrowserController):
         return self.delays.get_delays(["action", "goto", "upload"])
 
     @property
-    def browser_state(self) -> Path | None:
+    def browser_state(self) -> str:
         states_root = Path(STATES_ROOT)
         states_root.mkdir(parents=True, exist_ok=True)
-        return states_root / (self.config.userid + ".json")
+        return str(states_root / (self.config.userid + ".json"))
 
     def check_quiet_hours(self):
         if self.quiet_hours:
@@ -444,7 +446,7 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | str | Literal["today","yesterday"] = "today",
-            task_delay: float = 5.,
+            task_delay: float = 30.,
             vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
@@ -487,7 +489,7 @@ class Farmer(BrowserController):
         else:
             return cutoff_date if isinstance(cutoff_date, dt.date) else dt.date.today()
 
-    def wait_task_loop(self, loop_step: int, task_delay: float = 5., verbose: int | str | Path = 0):
+    def wait_task_loop(self, loop_step: int, task_delay: float = 30., verbose: int | str | Path = 0):
         comment_min_delay = self.min_action_delay("comment")
         article_min_delay = self.min_action_delay("article")
 
@@ -526,7 +528,8 @@ class Farmer(BrowserController):
             dry_run: bool = False,
             save_log: bool = True,
         ) -> StopTask:
-        stop_task, flag = False, None
+        stop_task, flag, vpn_ip = False, None, None
+        max_task_error = max_retries.get("task_error") or 10
         max_vpn_retries = max_retries.get("vpn_connect") or 10
 
         for i in range(len(self.configs)):
@@ -541,31 +544,30 @@ class Farmer(BrowserController):
 
             state = self.browser_state if with_state else None
             self.print_loop("task_loop_start", loop_step, verbose, state=state)
-            vpn_connected = False
 
             try:
                 self.check_quiet_hours()
 
-                if self.vpn_enabled and (ip_addr := self.config.ip_addr):
-                    vpn_connected = self.ensure_vpn_connected(ip_addr, max_vpn_retries, vpn_delay)
+                if self.vpn_enabled and (target_ip := self.config.ip_addr):
+                    vpn_ip = self.ensure_vpn_connected(target_ip, vpn_ip, max_vpn_retries, vpn_delay)
 
-                try:
-                    self.do_actions(
-                        max_retries, num_my_articles, max_read_length, max_reply_length,
-                        reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
-                finally:
-                    if vpn_connected:
-                        self.vpn.disconnect(**self.vpn_config.wait_options)
+                self.do_actions(
+                    max_retries, num_my_articles, max_read_length, max_reply_length,
+                    reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
             except Exception as error:
-                self.log.error = dict(
+                self.log.errors.append(dict(
                     type = str(type(error).__name__),
                     message = self.get_error_msg(error),
                     exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
                     flag = (flag := self.get_error_flag(error)),
-                )
+                ))
+                if (len(self.log.errors) % 3) and state and os.path.exists(state):
+                    os.remove(state)
+                if len(self.log.errors) > max_task_error:
+                    flag = "오류 횟수 초과"
 
             self.log.last_active_ts = dt.datetime.now()
-            self.log.time_on_cafe = (self.log.time_on_cafe or 0.) + self.config.timer.end_timer("visit", 3)
+            self.log.time_on_cafe = (self.log.time_on_cafe or 0.) + (self.config.timer.end_timer("visit", 3) or 0.)
             self.print_loop("task_loop_end", loop_step, verbose)
 
             if save_log:
@@ -573,14 +575,17 @@ class Farmer(BrowserController):
 
             stop_task = self.handle_error_flag(flag)
 
-            if (not stop_task) and vpn_connected:
-                wait(vpn_delay)
-
             if self.write_config:
                 try:
                     self.write_log_table_to_gsheets(**self.write_config)
                 except Exception:
                     pass
+
+        if vpn_ip:
+            try:
+                self.vpn.disconnect(**self.vpn_config.wait_options)
+            except Exception:
+                pass
 
         return stop_task
 
@@ -1069,7 +1074,7 @@ class Farmer(BrowserController):
             return "프롬프트 없음"
         elif isinstance(error, QuietHoursError):
             return "금지 시간대"
-        elif isinstance(error, TimeoutError):
+        elif isinstance(error, PlaywrightTimeoutError):
             return "브라우저 조작 오류"
         else:
             return "알 수 없는 오류"
@@ -1091,8 +1096,8 @@ class Farmer(BrowserController):
             for config in self.configs:
                 if config.userid == userid:
                     config.zero_counter("all")
-            if (state := self.browser_state) and state.exists():
-                os.remove(str(state))
+            if self.browser_state and os.path.exists(self.browser_state):
+                os.remove(self.browser_state)
             return False
 
         elif flag.startswith("카페 비회원"):
@@ -1112,6 +1117,10 @@ class Farmer(BrowserController):
             for config in self.configs:
                 if (config.userid == userid) and (config.cafe.dst == cafe_name):
                     config.zero_counter("all")
+            return False
+
+        elif flag == "오류 횟수 초과":
+            self.config.zero_counter("all")
             return False
 
         else:
@@ -1216,7 +1225,7 @@ class Farmer(BrowserController):
                 new_reply_count = sum([len(replies["replies"]) for replies in log.written_replies]),
                 new_like_count = len([1 for activity in log.read_articles if activity.get("like_this")]),
                 total_steps = log.total_steps,
-                error_flag = log.error["flag"] if log.error else None,
+                error_flag = ", ".join([error["flag"] for error in log.errors]) if log.errors else None,
             ))
         return rows
 
@@ -1252,19 +1261,39 @@ class Farmer(BrowserController):
             self.vpn_config = None
             self.vpn_enabled = False
 
-    def ensure_vpn_connected(self, ip_addr: str, max_vpn_retries: int = 10, vpn_delay: float = 5.) -> bool:
+    def ensure_vpn_connected(
+            self,
+            target_ip: str,
+            source_ip: str | None = None,
+            max_vpn_retries: int = 10,
+            vpn_delay: float = 5.,
+        ) -> str:
+        if source_ip:
+            try:
+                if target_ip == source_ip:
+                    self.vpn.wait_for_connection(source_ip, **self.vpn_config.wait_options)
+                    return
+                else:
+                    self.vpn.disconnect(**self.vpn_config.wait_options)
+            except Exception:
+                self.safe_terminate_vpn()
+            wait(vpn_delay)
+
         for step in range(1, max_vpn_retries+1):
             try:
                 self.vpn.start_process(force_restart=False)
                 self.vpn.try_login(**self.vpn_config.login)
-                if self.vpn.search_and_connect(ip_addr, **self.vpn_config.connect):
-                    return True
+                if (connected_ip := self.vpn.search_and_connect(target_ip, **self.vpn_config.connect)):
+                    return connected_ip
             except VpnInUseError as error:
                 raise error
             except Exception:
-                try:
-                    self.vpn.terminate_process()
-                except:
-                    pass
+                self.safe_terminate_vpn()
             wait(vpn_delay * step)
         raise VpnFailedError("VPN이 연결되지 않았습니다.")
+
+    def safe_terminate_vpn(self):
+        try:
+            self.vpn.terminate_process()
+        except Exception:
+            pass
