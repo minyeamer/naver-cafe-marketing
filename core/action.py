@@ -74,10 +74,16 @@ class ActionLog(TypedDict):
     today: TodayCount
 
 
-class CafeNotFound(RuntimeError):
+class CafeNotFoundError(RuntimeError):
+    ...
+
+class CafeNotLoadedError(RuntimeError):
     ...
 
 class CafeBannedError(RuntimeError):
+    ...
+
+class ArticlePermissionError(RuntimeError):
     ...
 
 
@@ -96,24 +102,30 @@ def goto_cafe_home(
         return
     goto_naver_main(page, mobile, goto_delay)
 
-    if mobile:
-        page.tap('#MM_logo [href="/aside/"]'), wait(goto_delay)
-        if page.locator(".layer_alert").count() > 0:
-            page.tap(".layer_alert .la_option"), wait(action_delay)
-        page.tap('[href="https://m.cafe.naver.com"]'), wait(goto_delay)
-    else:
-        page.goto(cafe_url(mobile=False)), wait(goto_delay)
-        # :has(a[href="https://cafe.naver.com"][target="_blank"])
-        # from ncafe.utils.desktop import click_new_page
-        # click_new_page(context, page, '[href="https://cafe.naver.com"]')
+    try:
+        if mobile:
+            page.tap('#MM_logo [href="/aside/"]'), wait(goto_delay)
+            if page.locator(".layer_alert").count() > 0:
+                page.tap(".layer_alert .la_option"), wait(action_delay)
+            page.tap('[href="https://m.cafe.naver.com"]'), wait(goto_delay)
+        else:
+            page.goto(cafe_url(mobile=False)), wait(goto_delay)
+            # :has(a[href="https://cafe.naver.com"][target="_blank"])
+            # from ncafe.utils.desktop import click_new_page
+            # click_new_page(context, page, '[href="https://cafe.naver.com"]')
+    except:
+        page.goto(cafe_url(mobile)), wait(goto_delay)
 
 
 def return_to_cafe_home(page: Page, mobile: bool = True, goto_delay: Delay = (1, 3)):
-    selector = f'[href="{cafe_url(mobile)}"]'
-    if mobile:
-        page.locator(selector).tap(), wait(goto_delay)
-    else:
-        page.locator(selector).click(), wait(goto_delay)
+    selector = f'.WebHeader [href="{cafe_url(mobile)}"]'
+    try:
+        if mobile:
+            page.locator(selector).tap(), wait(goto_delay)
+        else:
+            page.locator(selector).click(), wait(goto_delay)
+    except:
+        page.goto(cafe_url(mobile)), wait(goto_delay)
 
 
 def goto_naver_main(
@@ -144,22 +156,34 @@ def goto_cafe(page: Page, cafe_name: str, goto_delay: Delay = (1, 3), timeout: f
     """## Action 1"""
     try:
         locate(page, 'a:has-text("내 카페")', nth=-1).tap()
-    except Exception:
+    except:
         page.goto("https://m.cafe.naver.com/ca-fe/home/cafes/join")
     wait(goto_delay)
 
     try:
         page.wait_for_selector(cafe_link := f'.cafe_info:has-text("{cafe_name}")', timeout=timeout)
-    except Exception:
+    except:
         if page.locator(".cafe_info").count() == 0:
-            page.locator(cafe_link).tap(timeout=1000)
+            raise CafeNotLoadedError("가입카페 목록이 로딩되지 않았습니다.")
         else:
-            raise CafeNotFound(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
+            raise CafeNotFoundError(f"가입카페 목록에서 '{cafe_name}' 카페를 찾을 수 없습니다.")
 
     ranges = dict(
         boundary = page.locator("body").first,
         overlay = dict(top=page.locator(".HeaderWrap").first.bounding_box()["height"]))
     safe_tap(page, cafe_link, **ranges), wait(goto_delay)
+
+
+def goto_cafe_url(
+        page: Page,
+        cafe_id: int | str,
+        menu_id: int | str | None = None,
+        mobile: bool = True,
+        goto_delay: Delay = (1, 3),
+    ):
+    path = f"https://{'m.' if mobile else 'www.'}cafe.naver.com/ca-fe/web/cafes"
+    url = f"{path}/{cafe_id}/menus/{menu_id}" if menu_id is not None else f"{path}/{cafe_id}"
+    page.goto(url), wait(goto_delay)
 
 
 def go_back(page: Page, goto_delay: Delay = (1, 3)):
@@ -176,11 +200,11 @@ def get_cafe_ranges(page: Page, header: bool = True, tab: bool = False) -> CafeR
 def _get_cafe_overlay(page: Page, header: bool = True, tab: bool = False) -> Overlay:
     try:
         header_height = page.locator(".WebHeader").first.bounding_box()["height"] if header else 0
-    except Exception:
+    except:
         header_height = 52
     try:
         tab_height = page.locator(".ArticleTab").first.bounding_box()["height"] if tab else 0
-    except Exception:
+    except:
         tab_height = 66
     return dict(top = (header_height + tab_height))
 
@@ -323,6 +347,10 @@ def read_article(
         elif isin_viewport:
             isin_viewport = False
             read_end = i
+
+    if page.locator("#postContent > .article_permission").count() > 0:
+        message = lines[min(1, len(lines)-1)] if lines else "카페에 가입하면 바로 글을 볼 수 있어요!"
+        raise ArticlePermissionError(message)
 
     total_lines = len(lines)
     if isin_viewport and total_lines:
@@ -536,7 +564,7 @@ def write_article(
         raise CafeBannedError(dialog.value)
     except CafeBannedError as error:
         raise error
-    except Exception:
+    except:
         pass
 
     if kwargs.pop("agent_name", str()) == "modify_article":
@@ -641,11 +669,11 @@ def read_action_log(
             page.tap("header .info_link"), wait(goto_delay)
             try:
                 today_count = _read_daily_log(page, today_count, goto_delay, today)
-            except Exception:
+            except:
                 pass
             finally:
                 close_info(page, goto_delay)
-        except Exception:
+        except:
             pass
         return dict(total=total_count, today=today_count)
     finally:

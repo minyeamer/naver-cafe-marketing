@@ -6,8 +6,8 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from core.login import login, NaverLoginError
 from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
 
-from core.action import CafeNotFound, CafeBannedError, Wpm, ActionLog
-from core.action import goto_cafe_home, goto_cafe, goto_menu, return_to_cafe_home
+from core.action import CafeNotFoundError, CafeNotLoadedError, CafeBannedError, Wpm, ActionLog
+from core.action import goto_cafe_home, goto_cafe, goto_menu, goto_cafe_url, return_to_cafe_home
 from core.action import goto_article, explore_articles
 from core.action import reload_articles, next_articles, go_back
 from core.action import read_article, read_full_article, read_article_and_write_comment
@@ -103,8 +103,12 @@ class Config(TypedDict):
     userid: str
     passwd: str
     ip_addr: str
+    dst_cafe_id: str
+    dst_menu_id: str
     dst_cafe: str
     dst_menu: str
+    src_cafe_id: str
+    src_menu_id: str
     src_cafe: str
     src_menu: str
     read_count: str
@@ -124,6 +128,7 @@ class Config(TypedDict):
     total_visit_count: int
     total_article_count: int
     total_comment_count: int
+    error_delay: int
 
 class ActionCount(TypedDict):
     read: int
@@ -135,6 +140,7 @@ class ActionDelay(TypedDict):
     visit: int
     comment: int
     article: int
+    error: int
 
 class ActionLimit(TypedDict):
     visit: int
@@ -154,8 +160,10 @@ class ActionStatus(TypedDict):
 
 
 class CafeInfo(AttrDict):
-    def __init__(self, name: str, menu: str):
+    def __init__(self, id: str, name: str, menu_id: str, menu: str):
+        self.id = id
         self.name = name
+        self.menu_id = menu_id
         self.menu = menu
 
 class CafePair(AttrDict):
@@ -173,8 +181,12 @@ class ConfigWrapper(AttrDict):
         self.passwd = config["passwd"]
         self.ip_addr = config["ip_addr"]
         self.cafe: CafePair = CafePair(
-            dst = dict(name=config["dst_cafe"], menu=config["dst_menu"]),
-            src = dict(name=config["src_cafe"], menu=config["src_menu"]),
+            dst = {
+                "id": config["dst_cafe_id"], "name": config["dst_cafe"],
+                "menu_id": config["dst_menu_id"], "menu": config["dst_menu"]},
+            src = {
+                "id": config["src_cafe_id"], "name": config["src_cafe"],
+                "menu_id": config["src_menu_id"], "menu": config["src_menu"]},
         )
 
         def safe_int(value: int | str) -> int:
@@ -490,21 +502,15 @@ class Farmer(BrowserController):
             return cutoff_date if isinstance(cutoff_date, dt.date) else dt.date.today()
 
     def wait_task_loop(self, loop_step: int, task_delay: float = 30., verbose: int | str | Path = 0):
-        comment_min_delay = self.min_action_delay("comment")
-        article_min_delay = self.min_action_delay("article")
+        delays = [delay for key in ["comment","article","error"]
+            if isinstance(delay := self.min_action_delay(key), float)]
+        min_delay = min(delays) if delays else 0.
 
-        if not isinstance(comment_min_delay, float):
-            min_delay = article_min_delay or 0.
-        elif not isinstance(article_min_delay, float):
-            min_delay = comment_min_delay or 0.
-        else:
-            min_delay = min(comment_min_delay, article_min_delay)
+        wait_delay = max(task_delay, min_delay)
+        self.print_loop("task_loop_wait", loop_step, verbose, seconds=wait_delay)
+        wait(wait_delay)
 
-        delay = max(task_delay, min_delay)
-        self.print_loop("task_loop_wait", loop_step, verbose, seconds=delay)
-        wait(delay)
-
-    def min_action_delay(self, key: Literal["comment","article"]) -> float | None:
+    def min_action_delay(self, key: Literal["comment","article","error"]) -> float | None:
         delays = [max(0., config.delay[key] - secs)
             for config in self.configs
                 if (config.counter[key] > 0) and isinstance(secs := config.timer.get_elapsed_time(key), float)]
@@ -554,7 +560,9 @@ class Farmer(BrowserController):
                 self.do_actions(
                     max_retries, num_my_articles, max_read_length, max_reply_length,
                     reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
+                self.config.timer.end_timer("error")
             except Exception as error:
+                self.config.timer.start_timer("error")
                 self.log.errors.append(dict(
                     type = str(type(error).__name__),
                     message = self.get_error_msg(error),
@@ -578,13 +586,13 @@ class Farmer(BrowserController):
             if self.write_config:
                 try:
                     self.write_log_table_to_gsheets(**self.write_config)
-                except Exception:
+                except:
                     pass
 
         if vpn_ip:
             try:
                 self.vpn.disconnect(**self.vpn_config.wait_options)
-            except Exception:
+            except:
                 pass
 
         return stop_task
@@ -719,6 +727,8 @@ class Farmer(BrowserController):
                         if article:
                             articles.append(dict(article, clubid=params["clubid"], articleid=params["articleid"]))
                             self.log.read_articles.append(article)
+                    except:
+                        pass
                     finally:
                         go_back(self.page, self.delays.goto)
 
@@ -839,9 +849,15 @@ class Farmer(BrowserController):
         wait(self.delays.goto)
 
         cafe = self.config.cafe.src if target == "src" else self.config.cafe.dst
-        goto_cafe(self.page, cafe.name, self.delays.goto), wait(self.delays.goto) # Action 1
-        self.config.timer.start_timer("visit")
-        goto_menu(self.page, cafe.menu, **self.delays2), wait(self.delays.goto) # Action 2
+        try:
+            goto_cafe(self.page, cafe.name, self.delays.goto), wait(self.delays.goto) # Action 1
+            self.config.timer.start_timer("visit")
+            goto_menu(self.page, cafe.menu, **self.delays2), wait(self.delays.goto) # Action 2
+        except (Exception if target == "src" else CafeNotLoadedError) as error:
+            try:
+                goto_cafe_url(self.page, cafe.id, cafe.menu_id, self.mobile, self.delays.goto)
+            except:
+                raise error
 
     ############################# Action 9 ############################
 
@@ -1063,7 +1079,7 @@ class Farmer(BrowserController):
                 return "네이버 CAPTCHA 발생"
             else:
                 return "네이버 로그인 오류"
-        elif isinstance(error, CafeNotFound):
+        elif isinstance(error, CafeNotFoundError):
             cafe_name = match.group(1) if (match := re.search(r"'([^']+)'", str(error))) else "확인불가"
             return f"카페 비회원: {cafe_name}"
         elif isinstance(error, CafeBannedError):
@@ -1088,7 +1104,7 @@ class Farmer(BrowserController):
                 self.vpn.restart_service(**self.vpn_config.login)
                 self.config.zero_counter("all")
                 return False
-            except Exception:
+            except:
                 return True
 
         elif flag.startswith("네이버"):
@@ -1159,6 +1175,10 @@ class Farmer(BrowserController):
                 loop_step = loop_step,
                 seconds = kwargs.get("seconds"),
                 timers = {i: config.timer.get_all_elapsed_times() for i, config in enumerate(self.configs)},
+                delays = {i: {key: (config.delay[key] - secs)
+                    for key, secs in config.timer.get_all_elapsed_times().items()
+                            if (key in config.delay) and isinstance(secs, float)}
+                        for i, config in enumerate(self.configs)},
             )
         else:
             body = dict(
@@ -1275,7 +1295,7 @@ class Farmer(BrowserController):
                     return
                 else:
                     self.vpn.disconnect(**self.vpn_config.wait_options)
-            except Exception:
+            except:
                 self.safe_terminate_vpn()
             wait(vpn_delay)
 
@@ -1287,7 +1307,7 @@ class Farmer(BrowserController):
                     return connected_ip
             except VpnInUseError as error:
                 raise error
-            except Exception:
+            except:
                 self.safe_terminate_vpn()
             wait(vpn_delay * step)
         raise VpnFailedError("VPN이 연결되지 않았습니다.")
@@ -1295,5 +1315,5 @@ class Farmer(BrowserController):
     def safe_terminate_vpn(self):
         try:
             self.vpn.terminate_process()
-        except Exception:
+        except:
             pass

@@ -113,7 +113,7 @@ class Client(AttrDict):
                 title = str(window.window_text()).strip()
                 if title_patttern.search(title):
                     return window
-            except Exception:
+            except:
                 continue
         return None
 
@@ -249,7 +249,7 @@ class VpnClient(Client):
         try:
             login_btn: ButtonWrapper = window.descendants(control_type="Button", title="로그인")[0]
             login_btn.click_input()
-        except Exception:
+        except:
             raise ElementNotFoundError("로그인 버튼이 존재하지 않습니다.")
 
         try:
@@ -266,7 +266,7 @@ class VpnClient(Client):
         try:
             logout_btn: ButtonWrapper = window.descendants(control_type="Button", title="로그아웃")[0]
             logout_btn.click_input()
-        except Exception:
+        except:
             raise ElementNotFoundError("로그아웃 버튼이 존재하지 않습니다.")
 
     ######################## Search IP Address ########################
@@ -275,7 +275,7 @@ class VpnClient(Client):
         window = self.wait_service_ui(**wait_options)
         try:
             search_btn: ButtonWrapper = window.descendants(control_type="Button", title="검색")[0]
-        except Exception:
+        except:
             raise ElementNotFoundError("검색 버튼이 존재하지 않습니다.")
 
         search_input, (btn_x, btn_y) = None, self._center(search_btn)
@@ -328,7 +328,7 @@ class VpnClient(Client):
                 raise VpnInUseError(f"{service_no}번째 서비스가 사용 중입니다: '{ip_addr}'")
         except VpnInUseError as error:
             raise error
-        except Exception:
+        except:
             raise ElementNotFoundError(f"{service_no}번째 서비스가 존재하지 않습니다.")
 
         self.wait_for_connection(ip_addr, **wait_options)
@@ -340,7 +340,7 @@ class VpnClient(Client):
         try:
             action_btn: ButtonWrapper = window.descendants(control_type="Button", title="연결끊기")[0]
             action_btn.click_input()
-        except Exception:
+        except:
             raise ElementNotFoundError("연결끊기 버튼이 존재하지 않습니다.")
 
         try:
@@ -349,7 +349,7 @@ class VpnClient(Client):
                     confirm_btn: ButtonWrapper = buttons[0]
                     return confirm_btn.click_input()
                 time.sleep(interval)
-        except Exception:
+        except:
             raise ElementNotFoundError("VPN 접속 해제 확인창이 존재하지 않습니다.")
 
     def wait_for_connection(
