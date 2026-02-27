@@ -616,6 +616,7 @@ class Farmer(BrowserController):
             state: str | Path | None = None,
         ):
         self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
+        self.config.timer.start_timer("visit")
         write_timing = self.get_write_timing(num_my_articles)
 
         max_action_steps = max_retries.get("action_loop") or 100
@@ -853,7 +854,6 @@ class Farmer(BrowserController):
         cafe = self.config.cafe.src if target == "src" else self.config.cafe.dst
         try:
             goto_cafe(self.page, cafe.name, self.delays.goto), wait(self.delays.goto) # Action 1
-            self.config.timer.start_timer("visit")
             goto_menu(self.page, cafe.menu, **self.delays2), wait(self.delays.goto) # Action 2
         except (Exception if target == "src" else CafeNotLoadedError) as error:
             try:
