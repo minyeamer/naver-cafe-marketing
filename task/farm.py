@@ -513,7 +513,9 @@ class Farmer(BrowserController):
     def min_action_delay(self, key: Literal["comment","article","error"]) -> float | None:
         delays = [max(0., config.delay[key] - secs)
             for config in self.configs
-                if (config.counter[key] > 0) and isinstance(secs := config.timer.get_elapsed_time(key), float)]
+                if ((key in config.delay)
+                    and (config.counter.get(key, 1) > 0)
+                    and isinstance(secs := config.timer.get_elapsed_time(key), float))]
         return min(delays) if delays else None
 
     ############################# <start> #############################
