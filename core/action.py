@@ -572,20 +572,20 @@ def write_article(
     else:
         article = create_article(articles, my_articles, **prompt, verbose=verbose, **kwargs) # Agent 4
 
-    title_area = page.locator(".ArticleWriteFormSubject textarea").first
-    title_area.tap(), wait(action_delay)
-    title_area.type(article["title"], delay=100), wait(action_delay)
+    # title_area = page.locator(".ArticleWriteFormSubject textarea").first
+    # title_area.tap(), wait(action_delay)
+    # title_area.type(article["title"], delay=100), wait(action_delay)
 
-    content_area = page.locator("#one-editor article").first
-    content_area.tap(), wait(action_delay)
-    for line_no, content in enumerate(article["contents"]):
-        if line_no > 0:
-            page.keyboard.press("Enter"), wait(action_delay)
-        if content:
-            content_area.type(content, delay=100), wait(action_delay)
+    # content_area = page.locator("#one-editor article").first
+    # content_area.tap(), wait(action_delay)
+    # for line_no, content in enumerate(article["contents"]):
+    #     if line_no > 0:
+    #         page.keyboard.press("Enter"), wait(action_delay)
+    #     if content:
+    #         content_area.type(content, delay=100), wait(action_delay)
 
-    if not dry_run:
-        safe_tap(page, '.ArticleWriteComplete > [role="button"]', filters=dict(has_text="등록")), wait(upload_delay)
+    # if not dry_run:
+    #     safe_tap(page, '.ArticleWriteComplete > [role="button"]', filters=dict(has_text="등록")), wait(upload_delay)
 
     return article
 

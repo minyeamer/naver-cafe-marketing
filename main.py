@@ -1,9 +1,17 @@
 from __future__ import annotations
+import sys
+import os
+
+if getattr(sys, 'frozen', False):
+    _base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(
+        _base, 'playwright', 'driver', 'package', '.local-browsers'
+    )
 
 from task.farm import Farmer, MaxRetries, QuiteHours
 from core.action import Wpm
 from extensions.gsheets import WorksheetConnection
-from extensions.vpn import VpnConfig
+# from extensions.vpn import VpnConfig
 from utils.common import Delay
 
 from typing import TypedDict, TYPE_CHECKING
@@ -50,7 +58,7 @@ class RunConfig(TypedDict, total=False):
     reload_start_step: int
     reply_cutoff_date: dt.date | str | Literal["today"]
     task_delay: float
-    vpn_delay: float
+    # vpn_delay: float
     with_state: bool
     verbose: int | str | Path
     dry_run: bool
@@ -69,10 +77,10 @@ def main(
         browser: BrowserConfig,
         read: ReadConfig,
         run: RunConfig,
-        vpn: VpnConfig,
+        # vpn: VpnConfig,
         write: WorksheetConnection,
     ) -> Farmer:
-    farmer = Farmer(**browser, **read, vpn_config=vpn, write_config=write)
+    farmer = Farmer(**browser, **read, write_config=write)
     farmer.start(**run)
     return farmer
 

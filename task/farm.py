@@ -17,9 +17,9 @@ from core.action import read_my_articles, open_info, close_info, read_action_log
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 
 from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
-from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
-from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
-from extensions.vpn import WindowNotFoundError, ElementNotFoundError
+# from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
+# from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
+# from extensions.vpn import WindowNotFoundError, ElementNotFoundError
 
 from utils.common import AttrDict, Delay, wait, print_json
 from utils.timer import ActionTimer
@@ -77,7 +77,7 @@ class MaxRetries(TypedDict, total=False):
     task_error: int
     action_loop: int
     read_loop: int
-    vpn_connect: int
+    # vpn_connect: int
 
 class ArticleIdInfo(TypedDict):
     clubid: str
@@ -296,7 +296,7 @@ class ArticleActivity(TypedDict):
 
 
 ErrorFlag = Literal[
-    "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
+    # "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
     "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대",
     "브라우저 조작 오류", "알 수 없는 오류", "오류 횟수 초과"]
@@ -391,7 +391,7 @@ class Farmer(BrowserController):
             write_threshold: float = 0.4,
             dst_wpm: Wpm = dict(),
             src_wpm: Wpm = dict(),
-            vpn_config: VpnConfig = dict(),
+            # vpn_config: VpnConfig = dict(),
             write_config: WorksheetConnection = dict(),
             **kwargs
         ):
@@ -415,7 +415,7 @@ class Farmer(BrowserController):
         self.wpm: dict[Literal["dst","src"], Wpm] = dict(dst=dst_wpm, src=src_wpm)
         self.original_articles: set[tuple[CafeId, ArticleId]] = set()
 
-        self.set_vpn_client(vpn_config)
+        # self.set_vpn_client(vpn_config)
 
         self.validate_worksheet_connection(write_config, empty=True)
         self.write_config = write_config
@@ -459,7 +459,7 @@ class Farmer(BrowserController):
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | str | Literal["today","yesterday"] = "today",
             task_delay: float = 30.,
-            vpn_delay: float = 5.,
+            # vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -468,10 +468,10 @@ class Farmer(BrowserController):
         ):
         self.check_quiet_hours()
 
-        if self.vpn_enabled:
-            self.vpn.start_process(self.vpn_config.force_restart)
-            if not self.vpn.try_login(**self.vpn_config.login):
-                self.vpn.restart_service(**self.vpn_config.login)
+        # if self.vpn_enabled:
+        #     self.vpn.start_process(self.vpn_config.force_restart)
+        #     if not self.vpn.try_login(**self.vpn_config.login):
+        #         self.vpn.restart_service(**self.vpn_config.login)
 
         stop_task: StopTask = None
         reply_cutoff_date = self.get_cutoff_date(reply_cutoff_date)
@@ -485,10 +485,7 @@ class Farmer(BrowserController):
 
             stop_task = self.task_loop(
                 step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
-                reply_cutoff_date, vpn_delay, with_state, verbose, dry_run, save_log)
-
-        if self.vpn_enabled:
-            self.vpn.terminate_process()
+                reply_cutoff_date, with_state, verbose, dry_run, save_log)
 
     def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today","yesterday"] = "today") -> dt.date:
         if isinstance(cutoff_date, str):
@@ -530,15 +527,15 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | None = None,
-            vpn_delay: float = 5.,
+            # vpn_delay: float = 5.,
             with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             save_log: bool = True,
         ) -> StopTask:
-        stop_task, flag, vpn_ip = False, None, None
+        stop_task, flag = False, None
         max_task_error = max_retries.get("task_error") or 10
-        max_vpn_retries = max_retries.get("vpn_connect") or 10
+        # vpn_ip, max_vpn_retries = None, max_retries.get("vpn_connect") or 10
 
         for i in range(len(self.configs)):
             self.index = i
@@ -556,12 +553,13 @@ class Farmer(BrowserController):
             try:
                 self.check_quiet_hours()
 
-                if self.vpn_enabled and (target_ip := self.config.ip_addr):
-                    vpn_ip = self.ensure_vpn_connected(target_ip, vpn_ip, max_vpn_retries, vpn_delay)
+                # if self.vpn_enabled and (target_ip := self.config.ip_addr):
+                #     vpn_ip = self.ensure_vpn_connected(target_ip, vpn_ip, max_vpn_retries, vpn_delay)
 
                 self.do_actions(
                     max_retries, num_my_articles, max_read_length, max_reply_length,
-                    reload_start_step, reply_cutoff_date, verbose, dry_run, state=state)
+                    reload_start_step, reply_cutoff_date, verbose, dry_run,
+                    state=state, proxy=self.config.ip_addr)
                 self.config.timer.end_timer("error")
             except Exception as error:
                 self.config.timer.start_timer("error")
@@ -571,8 +569,6 @@ class Farmer(BrowserController):
                     exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
                     flag = (flag := self.get_error_flag(error)),
                 ))
-                if (len(self.log.errors) % 3) and state and os.path.exists(state):
-                    os.remove(state)
                 if len(self.log.errors) > max_task_error:
                     flag = "오류 횟수 초과"
 
@@ -590,12 +586,6 @@ class Farmer(BrowserController):
                     self.write_log_table_to_gsheets(**self.write_config)
                 except:
                     pass
-
-        if vpn_ip:
-            try:
-                self.vpn.disconnect(**self.vpn_config.wait_options)
-            except:
-                pass
 
         return stop_task
 
@@ -1059,20 +1049,20 @@ class Farmer(BrowserController):
             return None
 
     def get_error_flag(self, error: Exception) -> ErrorFlag:
-        if isinstance(error, VpnRuntimeError):
-            if isinstance(error, VpnLoginFailedError):
-                return "VPN 로그인 오류"
-            elif isinstance(error, VpnInUseError):
-                return "VPN 사용중"
-            elif isinstance(error, VpnFailedError):
-                return "VPN 접속 오류"
-            else:
-                return "VPN 오류"
-        elif isinstance(error, WindowNotFoundError):
-            return "VPN 확인 불가"
-        elif isinstance(error, ElementNotFoundError):
-            return "VPN 조작 오류"
-        elif isinstance(error, NaverLoginError):
+        # if isinstance(error, VpnRuntimeError):
+        #     if isinstance(error, VpnLoginFailedError):
+        #         return "VPN 로그인 오류"
+        #     elif isinstance(error, VpnInUseError):
+        #         return "VPN 사용중"
+        #     elif isinstance(error, VpnFailedError):
+        #         return "VPN 접속 오류"
+        #     else:
+        #         return "VPN 오류"
+        # elif isinstance(error, WindowNotFoundError):
+        #     return "VPN 확인 불가"
+        # elif isinstance(error, ElementNotFoundError):
+        #     return "VPN 조작 오류"
+        if isinstance(error, NaverLoginError):
             if isinstance(error, NaverLoginFailedError):
                 return "네이버 계정 불일치"
             elif isinstance(error, WarningAccountError):
@@ -1101,21 +1091,19 @@ class Farmer(BrowserController):
         if not isinstance(flag, str):
             return False
 
-        elif flag == "VPN 사용중":
-            try:
-                self.vpn.restart_service(**self.vpn_config.login)
-                self.config.zero_counter("all")
-                return False
-            except:
-                return True
+        # elif flag == "VPN 사용중":
+        #     try:
+        #         self.vpn.restart_service(**self.vpn_config.login)
+        #         self.config.zero_counter("all")
+        #         return False
+        #     except:
+        #         return True
 
         elif flag.startswith("네이버"):
             userid = self.config.userid
             for config in self.configs:
                 if config.userid == userid:
                     config.zero_counter("all")
-            if self.browser_state and os.path.exists(self.browser_state):
-                os.remove(self.browser_state)
             return False
 
         elif flag.startswith("카페 비회원"):
@@ -1142,7 +1130,7 @@ class Farmer(BrowserController):
             return False
 
         else:
-            return flag.startswith("VPN") or (flag in {"프롬프트 없음", "금지 시간대"})
+            return flag in {"프롬프트 없음", "금지 시간대"}
 
     ############################# Task Log ############################
 
@@ -1265,57 +1253,57 @@ class Farmer(BrowserController):
 
     ########################## VPN Extension ##########################
 
-    @property
-    def vpn(self) -> VpnClient:
-        if self.__vpn is not None:
-            return self.__vpn
-        else:
-            raise RuntimeError("VPN 클라이언트가 초기화되지 않았습니다.")
+    # @property
+    # def vpn(self) -> VpnClient:
+    #     if self.__vpn is not None:
+    #         return self.__vpn
+    #     else:
+    #         raise RuntimeError("VPN 클라이언트가 초기화되지 않았습니다.")
 
-    def set_vpn_client(self, vpn_config: VpnConfig = dict()):
-        if vpn_config:
-            config = vpn_config if isinstance(vpn_config, VpnConfig) else VpnConfig(**vpn_config)
-            self.__vpn = VpnClient(**config)
-            self.vpn_config = config
-            self.vpn_enabled = True
-        else:
-            self.__vpn = None
-            self.vpn_config = None
-            self.vpn_enabled = False
+    # def set_vpn_client(self, vpn_config: VpnConfig = dict()):
+    #     if vpn_config:
+    #         config = vpn_config if isinstance(vpn_config, VpnConfig) else VpnConfig(**vpn_config)
+    #         self.__vpn = VpnClient(**config)
+    #         self.vpn_config = config
+    #         self.vpn_enabled = True
+    #     else:
+    #         self.__vpn = None
+    #         self.vpn_config = None
+    #         self.vpn_enabled = False
 
-    def ensure_vpn_connected(
-            self,
-            target_ip: str,
-            source_ip: str | None = None,
-            max_vpn_retries: int = 10,
-            vpn_delay: float = 5.,
-        ) -> str:
-        if source_ip:
-            try:
-                if target_ip == source_ip:
-                    self.vpn.wait_for_connection(source_ip, **self.vpn_config.wait_options)
-                    return
-                else:
-                    self.vpn.disconnect(**self.vpn_config.wait_options)
-            except:
-                self.safe_terminate_vpn()
-            wait(vpn_delay)
+    # def ensure_vpn_connected(
+    #         self,
+    #         target_ip: str,
+    #         source_ip: str | None = None,
+    #         max_vpn_retries: int = 10,
+    #         vpn_delay: float = 5.,
+    #     ) -> str:
+    #     if source_ip:
+    #         try:
+    #             if target_ip == source_ip:
+    #                 self.vpn.wait_for_connection(source_ip, **self.vpn_config.wait_options)
+    #                 return
+    #             else:
+    #                 self.vpn.disconnect(**self.vpn_config.wait_options)
+    #         except:
+    #             self.safe_terminate_vpn()
+    #         wait(vpn_delay)
 
-        for step in range(1, max_vpn_retries+1):
-            try:
-                self.vpn.start_process(force_restart=False)
-                self.vpn.try_login(**self.vpn_config.login)
-                if (connected_ip := self.vpn.search_and_connect(target_ip, **self.vpn_config.connect)):
-                    return connected_ip
-            except VpnInUseError as error:
-                raise error
-            except:
-                self.safe_terminate_vpn()
-            wait(vpn_delay * step)
-        raise VpnFailedError("VPN이 연결되지 않았습니다.")
+    #     for step in range(1, max_vpn_retries+1):
+    #         try:
+    #             self.vpn.start_process(force_restart=False)
+    #             self.vpn.try_login(**self.vpn_config.login)
+    #             if (connected_ip := self.vpn.search_and_connect(target_ip, **self.vpn_config.connect)):
+    #                 return connected_ip
+    #         except VpnInUseError as error:
+    #             raise error
+    #         except:
+    #             self.safe_terminate_vpn()
+    #         wait(vpn_delay * step)
+    #     raise VpnFailedError("VPN이 연결되지 않았습니다.")
 
-    def safe_terminate_vpn(self):
-        try:
-            self.vpn.terminate_process()
-        except:
-            pass
+    # def safe_terminate_vpn(self):
+    #     try:
+    #         self.vpn.terminate_process()
+    #     except:
+    #         pass

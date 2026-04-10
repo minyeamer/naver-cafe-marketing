@@ -68,11 +68,13 @@ class BrowserState(AttrDict):
     def close_browser(self):
         self.__browser.close()
 
-    def new_context(self, device: str = str(), state: str | Path | None = None, **kwargs):
+    def new_context(self, device: str = str(), state: str | Path | None = None, proxy: str | None = None, **kwargs):
         if device:
             kwargs.update(self.__playwright.devices[device])
         if state and os.path.exists(str(state)):
             kwargs.update(storage_state=str(state))
+        if proxy:
+            kwargs.update(proxy={"server": proxy})
         self.__context = self.__browser.new_context(**kwargs)
 
     def new_page(self):
@@ -120,14 +122,14 @@ class BrowserController(AttrDict):
 
     def with_browser(func):
         @functools.wraps(func)
-        def wrapper(self: BrowserController, *args, state: str | Path | None = None, **kwargs):
+        def wrapper(self: BrowserController, *args, state: str | Path | None = None, proxy: str | None = None, **kwargs):
             self.reset_states()
             try:
                 with sync_playwright() as playwright:
                     self.states.set_playwright(playwright)
                     self.states.launch_browser(headless=self.headless)
                     try:
-                        self.states.new_context(self.device, state)
+                        self.states.new_context(self.device, state, proxy)
                         self.states.new_page()
                         return func(self, *args, state=state, **kwargs)
                     finally:
