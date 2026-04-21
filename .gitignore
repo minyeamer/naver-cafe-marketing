@@ -239,3 +239,4 @@ debug*.sh
 .prompts/
 .secrets/
 .logs/
+copilot-instructions.md

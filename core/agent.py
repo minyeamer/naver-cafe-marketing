@@ -235,12 +235,7 @@ def select_articles(
         kwargs["temperature"] = temperature
 
     try:
-        # [SKIP AGENT]
-        import random
-        time.sleep(random.uniform(3, 6))
-        k = int(len(articles) * 0.7)
-        article_ids = [article["articleid"] for article in random.sample(articles, k)] if k else list()
-        # article_ids = set(chat_json(model or "gpt-4o-mini", messages, name, verbose, **kwargs))
+        article_ids = set(chat_json(model or "gpt-4o-mini", messages, name, verbose, **kwargs))
         return [article for article in articles if article["articleid"] in article_ids]
     except Exception as e:
         print_json({"agent_name": name, "error": str(type(e)), "message": str(e)}, verbose)
@@ -415,12 +410,7 @@ def create_article(
         kwargs["reasoning_effort"] = reasoning_effort
 
     try:
-        # [SKIP AGENT]
-        import random
-        time.sleep(random.uniform(30, 60))
-        selected = random.sample(articles, 1)[0] if articles else {"title":None, "contents":list()}
-        article = {"title":selected["title"],"contents":selected["contents"],"type":None,"emotion":None,"violation_reason":None}
-        # article = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
+        article = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
         if not article.get("violation_reason"):
             article["created_at"] = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
             return article

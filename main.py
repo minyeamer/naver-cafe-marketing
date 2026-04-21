@@ -2,14 +2,17 @@ from __future__ import annotations
 import sys
 import os
 
-if getattr(sys, 'frozen', False):
-    _base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
-    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(
-        _base, 'playwright', 'driver', 'package', '.local-browsers'
+if getattr(sys, "frozen", False):
+    _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(
+        _base, "playwright", "driver", "package", ".local-browsers"
     )
 
 from task.farm import Farmer, MaxRetries, QuiteHours
+from task.profile import ProfileManager
+
 from core.action import Wpm
+from core.browser import MOBILE_DEVICE
 from extensions.gsheets import WorksheetConnection
 # from extensions.vpn import VpnConfig
 from utils.common import Delay
@@ -32,8 +35,8 @@ CONFIGS = [
 ]
 
 class BrowserConfig(TypedDict, total=False):
+    profiles_path: str | Path
     device: str
-    mobile: bool
     headless: bool
     action_delay: Delay
     goto_delay: Delay
@@ -43,6 +46,7 @@ class BrowserConfig(TypedDict, total=False):
 class ReadConfig(TypedDict):
     configs: WorksheetConnection
     openai_key: str | Path
+    mobile: bool
     quiet_hours: QuiteHours
     comment_threshold: float
     like_threshold: float
@@ -50,7 +54,7 @@ class ReadConfig(TypedDict):
     dst_wpm: Wpm
     src_wpm: Wpm
 
-class RunConfig(TypedDict, total=False):
+class FarmConfig(TypedDict, total=False):
     max_retries: MaxRetries
     num_my_articles: int
     max_read_length: int
@@ -59,10 +63,14 @@ class RunConfig(TypedDict, total=False):
     reply_cutoff_date: dt.date | str | Literal["today"]
     task_delay: float
     # vpn_delay: float
-    with_state: bool
     verbose: int | str | Path
     dry_run: bool
     save_log: bool
+
+class ProfileConfig(TypedDict, total=False):
+    prompt_close: bool
+    skip_if_logged_in: bool
+    wait_interval: float
 
 
 def read_configs(config_path: str | Path | None = None) -> dict:
@@ -73,17 +81,39 @@ def read_configs(config_path: str | Path | None = None) -> dict:
                 return yaml.safe_load(file.read())
 
 
-def main(
+def run_farm(
         browser: BrowserConfig,
         read: ReadConfig,
-        run: RunConfig,
+        farm: FarmConfig,
         # vpn: VpnConfig,
         write: WorksheetConnection,
+        **kwargs
     ) -> Farmer:
     farmer = Farmer(**browser, **read, write_config=write)
-    farmer.start(**run)
+    farmer.start(**farm)
     return farmer
 
 
+def run_profile(
+        accounts: WorksheetConnection,
+        browser: BrowserConfig,
+        profile: ProfileConfig,
+        **kwargs
+    ) -> ProfileManager:
+    manager = ProfileManager(
+        accounts = accounts,
+        profiles_path = browser.get("profiles_path"),
+        device = browser.get("device", MOBILE_DEVICE),
+        headless = browser.get("headless", False),
+    )
+    manager.start(**profile)
+    return manager
+
+
 if __name__ == "__main__":
-    main(**read_configs())
+    configs = read_configs()
+    mode = configs.pop("mode", "farm")
+    if mode == "profile":
+        run_profile(**configs)
+    else:
+        run_farm(**configs)

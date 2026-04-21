@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from core.browser import BrowserController
+from core.browser import BrowserController, ProfileNotFoundError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from core.login import login, NaverLoginError
+from core.login import NaverLoginError
 from core.login import WarningAccountError, ReCaptchaRequiredError, NaverLoginFailedError
 
 from core.action import CafeNotFoundError, CafeNotLoadedError, CafeBannedError, Wpm, ActionLog
@@ -49,7 +49,6 @@ class QuiteHours(TypedDict):
 
 SECRETS_ROOT = ".secrets"
 STATES_ROOT = os.path.join(SECRETS_ROOT, "states")
-MOBILE_DEVICE = "Galaxy S24"
 
 LOGS_ROOT = ".logs"
 
@@ -377,15 +376,16 @@ class Farmer(BrowserController):
     def __init__(
             self,
             configs: WorksheetConnection | Sequence[Config],
+            profiles_path: str | Path,
             openai_key:  str | Path | Literal[":default:"] = ":default:",
             device: str = str(),
-            mobile: bool = True,
             headless: bool = True,
             action_delay: Delay = (0.3, 0.6),
             goto_delay: Delay = (1, 3),
             reload_delay: Delay = (10, 12),
             upload_delay: Delay = (2, 4),
             quiet_hours: QuiteHours = dict(),
+            mobile: bool = True,
             comment_threshold: float = 0.3,
             like_threshold: float = 0.4,
             write_threshold: float = 0.4,
@@ -395,22 +395,25 @@ class Farmer(BrowserController):
             write_config: WorksheetConnection = dict(),
             **kwargs
         ):
-        super().__init__(device, mobile, headless, action_delay, goto_delay, reload_delay, upload_delay)
+        super().__init__(None, "Default",
+            device, headless, action_delay, goto_delay, reload_delay, upload_delay)
+        self.profiles_path: Path = Path(profiles_path) if profiles_path else Path()
 
         self.quiet_hours = quiet_hours
         self.check_quiet_hours()
 
         if isinstance(configs, dict):
             self.validate_worksheet_connection(configs, empty=False)
-            self.configs: list[ConfigWrapper] = self.read_configs_from_gsheets(**configs)
+            self.configs = self.read_configs_from_gsheets(**configs)
         elif isinstance(configs, Sequence):
-            self.configs: list[ConfigWrapper] = [ConfigWrapper(config) for config in configs]
+            self.configs = [ConfigWrapper(config) for config in configs]
         else:
             raise ValueError("설정이 올바르지 않습니다.")
 
         set_api_key(DEFAULTS["openai_key"] if is_default(openai_key) else openai_key)
 
         self.index: Index = 0
+        self.mobile = mobile
         self.threshold = ActionThreshold(comment_threshold, like_threshold, write_threshold)
         self.wpm: dict[Literal["dst","src"], Wpm] = dict(dst=dst_wpm, src=src_wpm)
         self.original_articles: set[tuple[CafeId, ArticleId]] = set()
@@ -429,18 +432,16 @@ class Farmer(BrowserController):
         return self.configs[self.index].log
 
     @property
+    def profile(self) -> dict:
+        return {"path": (self.profiles_path / self.config.userid), "dir": "Default"}
+
+    @property
     def delays2(self) -> dict[str,Delay]:
         return self.delays.get_delays(["action", "goto"])
 
     @property
     def delays3(self) -> dict[str,Delay]:
         return self.delays.get_delays(["action", "goto", "upload"])
-
-    @property
-    def browser_state(self) -> str:
-        states_root = Path(STATES_ROOT)
-        states_root.mkdir(parents=True, exist_ok=True)
-        return str(states_root / (self.config.userid + ".json"))
 
     def check_quiet_hours(self):
         if self.quiet_hours:
@@ -460,7 +461,6 @@ class Farmer(BrowserController):
             reply_cutoff_date: dt.date | str | Literal["today","yesterday"] = "today",
             task_delay: float = 30.,
             # vpn_delay: float = 5.,
-            with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             save_log: bool = True,
@@ -485,7 +485,7 @@ class Farmer(BrowserController):
 
             stop_task = self.task_loop(
                 step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
-                reply_cutoff_date, with_state, verbose, dry_run, save_log)
+                reply_cutoff_date, verbose, dry_run, save_log)
 
     def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today","yesterday"] = "today") -> dt.date:
         if isinstance(cutoff_date, str):
@@ -528,7 +528,6 @@ class Farmer(BrowserController):
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | None = None,
             # vpn_delay: float = 5.,
-            with_state: bool = True,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             save_log: bool = True,
@@ -547,10 +546,8 @@ class Farmer(BrowserController):
                 self.config.zero_counter("all")
                 continue
 
-            state = self.browser_state if with_state else None
-            self.print_loop("task_loop_start", loop_step, verbose, state=state)
-
             try:
+                self.print_loop("task_loop_start", loop_step, verbose)
                 self.check_quiet_hours()
 
                 # if self.vpn_enabled and (target_ip := self.config.ip_addr):
@@ -558,8 +555,7 @@ class Farmer(BrowserController):
 
                 self.do_actions(
                     max_retries, num_my_articles, max_read_length, max_reply_length,
-                    reload_start_step, reply_cutoff_date, verbose, dry_run,
-                    state=state, proxy=self.config.ip_addr)
+                    reload_start_step, reply_cutoff_date, verbose, dry_run, proxy=self.config.ip_addr)
                 self.config.timer.end_timer("error")
             except Exception as error:
                 self.config.timer.start_timer("error")
@@ -591,7 +587,7 @@ class Farmer(BrowserController):
 
     ###################### Single account actions #####################
 
-    @BrowserController.with_browser
+    @BrowserController.with_chrome_profile
     def do_actions(
             self,
             max_retries: MaxRetries = dict(),
@@ -602,10 +598,9 @@ class Farmer(BrowserController):
             reply_cutoff_date: dt.date | None = None,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
-            *,
-            state: str | Path | None = None,
+            **kwargs
         ):
-        self.navigate_to_menu(has_state=(bool(state) and os.path.exists(str(state))))
+        self.navigate_to_menu()
         self.config.timer.start_timer("visit")
         write_timing = self.get_write_timing(num_my_articles)
 
@@ -829,16 +824,13 @@ class Farmer(BrowserController):
 
     def navigate_to_menu(
             self,
-            has_state: bool = True,
             referer: Literal["cafe"] | None = None,
             target: Literal["dst","src"] = "dst",
         ):
         if referer == "cafe":
             return_to_cafe_home(self.page, self.mobile, self.delays.goto)
-        elif has_state:
-            goto_cafe_home(self.page, self.mobile, **self.delays2) # Action 0
         else:
-            login(self.page, self.config.userid, self.config.passwd, "cafe", self.mobile, **self.delays2)
+            goto_cafe_home(self.page, self.mobile, **self.delays2) # Action 0
         wait(self.delays.goto)
 
         cafe = self.config.cafe.src if target == "src" else self.config.cafe.dst
@@ -1049,7 +1041,9 @@ class Farmer(BrowserController):
             return None
 
     def get_error_flag(self, error: Exception) -> ErrorFlag:
-        # if isinstance(error, VpnRuntimeError):
+        if isinstance(error, ProfileNotFoundError):
+            return "Chrome 프로필 없음"
+        # elif isinstance(error, VpnRuntimeError):
         #     if isinstance(error, VpnLoginFailedError):
         #         return "VPN 로그인 오류"
         #     elif isinstance(error, VpnInUseError):
@@ -1062,7 +1056,7 @@ class Farmer(BrowserController):
         #     return "VPN 확인 불가"
         # elif isinstance(error, ElementNotFoundError):
         #     return "VPN 조작 오류"
-        if isinstance(error, NaverLoginError):
+        elif isinstance(error, NaverLoginError):
             if isinstance(error, NaverLoginFailedError):
                 return "네이버 계정 불일치"
             elif isinstance(error, WarningAccountError):
@@ -1099,7 +1093,7 @@ class Farmer(BrowserController):
         #     except:
         #         return True
 
-        elif flag.startswith("네이버"):
+        elif flag.startswith("네이버") or (flag == "Chrome 프로필 없음"):
             userid = self.config.userid
             for config in self.configs:
                 if config.userid == userid:
