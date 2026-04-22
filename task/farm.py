@@ -486,6 +486,7 @@ class Farmer(BrowserController):
 
         for step in range(1, (max_retries.get("task_loop") or 30)+1):
             if stop_task or all([config.done for config in self.configs]):
+                self.notify_task_loop(step, end_flag=("실패" if stop_task else "완료"))
                 break
 
             if isinstance(stop_task, bool):
@@ -513,7 +514,7 @@ class Farmer(BrowserController):
 
         wait_delay = max(task_delay, min_delay)
         self.print_loop("task_loop_wait", loop_step, verbose, seconds=wait_delay)
-        self.notify_task_loop(loop_step, wait_delay)
+        self.notify_task_loop(loop_step, wait_delay=wait_delay)
         wait(wait_delay)
 
     def min_action_delay(self, key: Literal["comment", "article", "error"]) -> float | None:
@@ -541,7 +542,7 @@ class Farmer(BrowserController):
             dry_run: bool = False,
             save_log: bool = True,
         ) -> StopTask:
-        stop_task, flag = False, None
+        stop_task, error_flag = False, None
         max_task_error = max_retries.get("task_error") or 10
         # vpn_ip, max_vpn_retries = None, max_retries.get("vpn_connect") or 10
 
@@ -568,14 +569,15 @@ class Farmer(BrowserController):
                 self.config.timer.end_timer("error")
             except Exception as error:
                 self.config.timer.start_timer("error")
+                error_flag = self.get_error_flag(error)
                 self.log.errors.append(dict(
                     type = str(type(error).__name__),
                     message = self.get_error_msg(error),
                     exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
-                    flag = (flag := self.get_error_flag(error)),
+                    error_flag = error_flag,
                 ))
                 if len(self.log.errors) > max_task_error:
-                    flag = "오류 횟수 초과"
+                    error_flag = "오류 횟수 초과"
 
             self.log.last_active_ts = dt.datetime.now()
             self.log.time_on_cafe = (self.log.time_on_cafe or 0.) + (self.config.timer.end_timer("visit", 3) or 0.)
@@ -584,7 +586,7 @@ class Farmer(BrowserController):
             if save_log:
                 self.save_log_json()
 
-            stop_task = self.handle_error_flag(flag)
+            stop_task = self.handle_error_flag(error_flag)
 
             if self.write_config:
                 try:
@@ -592,7 +594,7 @@ class Farmer(BrowserController):
                 except:
                     pass
 
-            self.notify_action_end(loop_step, flag)
+            self.notify_action_end(loop_step, error_flag)
 
         return stop_task
 
@@ -1099,11 +1101,11 @@ class Farmer(BrowserController):
         else:
             return "알 수 없는 오류"
 
-    def handle_error_flag(self, flag: ErrorFlag) -> StopTask:
-        if not isinstance(flag, str):
+    def handle_error_flag(self, error_flag: ErrorFlag) -> StopTask:
+        if not isinstance(error_flag, str):
             return False
 
-        # elif flag == "VPN 사용중":
+        # elif error_flag == "VPN 사용중":
         #     try:
         #         self.vpn.restart_service(**self.vpn_config.login)
         #         self.config.zero_counter("all")
@@ -1111,17 +1113,17 @@ class Farmer(BrowserController):
         #     except:
         #         return True
 
-        elif flag.startswith("네이버") or (flag == "Chrome 프로필 없음"):
+        elif error_flag.startswith("네이버") or (error_flag == "Chrome 프로필 없음"):
             userid = self.config.userid
             for config in self.configs:
                 if config.userid == userid:
                     config.zero_counter("all")
             return False
 
-        elif flag.startswith("카페 비회원"):
+        elif error_flag.startswith("카페 비회원"):
             userid = self.config.userid
             dst, src = self.config.cafe.dst.name, self.config.cafe.src.name
-            cafe_name = flag.split(": ")[1]
+            cafe_name = error_flag.split(": ")[1]
             cafes = {dst, src} if cafe_name == "확인불가" else ({dst} if dst == cafe_name else {src})
 
             for config in self.configs:
@@ -1130,19 +1132,19 @@ class Farmer(BrowserController):
                     config.zero_counter("all")
             return False
 
-        elif flag == "카페 활동정지":
+        elif error_flag == "카페 활동정지":
             userid, cafe_name = self.config.userid, self.config.cafe.dst
             for config in self.configs:
                 if (config.userid == userid) and (config.cafe.dst == cafe_name):
                     config.zero_counter("all")
             return False
 
-        elif flag == "오류 횟수 초과":
+        elif error_flag == "오류 횟수 초과":
             self.config.zero_counter("all")
             return False
 
         else:
-            return flag in {"프롬프트 없음", "금지 시간대"}
+            return error_flag in {"프롬프트 없음", "금지 시간대"}
 
     ############################# Task Log ############################
 
@@ -1285,10 +1287,19 @@ class Farmer(BrowserController):
     def cafe_md(self) -> str:
         return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu}"
 
-    def notify_task_loop(self, loop_step: int, wait_delay: float | None = None, sep: str = "  ·  "):
+    def notify_task_loop(
+            self,
+            loop_step: int,
+            *,
+            end_flag: Literal["완료", "실패"] | None = None,
+            wait_delay: float | None = None,
+            sep: str = "  ·  "
+        ):
         lines = list()
 
-        if loop_step == 1:
+        if end_flag:
+            first_line = [f"[프로그램 {end_flag}]  반복 횟수 {loop_step}"]
+        elif loop_step == 1:
             first_line = [f"[프로그램 시작]  {len(self.configs)}개 계정-카페 활동 대기"]
         else:
             first_line = [f"[프로그램 대기]  반복 횟수 {loop_step}"]
@@ -1378,7 +1389,7 @@ class Farmer(BrowserController):
             "글 >  {}".format(f"<{url}|{title}>" if url else f"*{title}*"),
         ]))
 
-    def notify_action_end(self, loop_step: int, flag: str | None, sep: str = "  ·  "):
+    def notify_action_end(self, loop_step: int, error_flag: str | None, sep: str = "  ·  "):
         config, log = self.config, self.log
         bullet1 = bullet2 = ":black_medium_small_square: "
 
@@ -1388,9 +1399,9 @@ class Farmer(BrowserController):
         time_on = seconds_to_mmss(log.time_on_cafe) if isinstance(log.time_on_cafe, float) else '-'
         reply_count = sum(len(r["replies"]) for r in log.written_replies)
 
-        if flag:
+        if error_flag:
             status = "실패"
-            bullet1 = f":small_red_triangle: {flag}{sep}"
+            bullet1 = f":small_red_triangle: {error_flag}{sep}"
         else:
             status = "완료" if self.config.done else "대기"
 
