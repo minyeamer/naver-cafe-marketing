@@ -14,6 +14,7 @@ from task.profile import ProfileManager
 from core.action import Wpm
 from core.browser import MOBILE_DEVICE
 from extensions.gsheets import WorksheetConnection
+from extensions.slack import SlackConfig
 # from extensions.vpn import VpnConfig
 from utils.common import Delay
 
@@ -87,9 +88,10 @@ def run_farm(
         farm: FarmConfig,
         # vpn: VpnConfig,
         write: WorksheetConnection,
+        slack: SlackConfig,
         **kwargs
     ) -> Farmer:
-    farmer = Farmer(**browser, **read, write_config=write)
+    farmer = Farmer(**browser, **read, write_config=write, slack_config=slack)
     farmer.start(**farm)
     return farmer
 

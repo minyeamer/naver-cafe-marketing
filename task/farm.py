@@ -17,6 +17,7 @@ from core.action import read_my_articles, open_info, close_info, read_action_log
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 
 from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
+from extensions.slack import SlackClient, SlackConfig
 # from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
 # from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
 # from extensions.vpn import WindowNotFoundError, ElementNotFoundError
@@ -30,6 +31,7 @@ import datetime as dt
 import json
 import re
 
+from math import ceil
 from pathlib import Path
 import os
 import random
@@ -231,22 +233,25 @@ class ConfigWrapper(AttrDict):
     def timer(self) -> ActionTimer:
         return self.__timer
 
-    def calc_counter(self, key: Literal["read","article","comment","like"]) -> int:
+    def get_initial_count(self, key: Literal["read", "article", "comment", "like"]) -> int:
+        return self.__counter.get(key, 0)
+
+    def calc_counter(self, key: Literal["read", "article", "comment", "like"]) -> int:
         return self.__counter.get(key, 0) - self.counter.get(key, 0)
 
-    def reset_counter(self, key: Literal["all","read","article","comment","like"]):
+    def reset_counter(self, key: Literal["all", "read", "article", "comment", "like"]):
         if key == "all":
             self.counter[key] = {key: self.__counter.get(key, 0) for key in self.counter.keys()}
         else:
             self.counter[key] = self.__counter.get(key, 0)
 
-    def sub_counter(self, key: Literal["all","read","article","comment","like"]):
+    def sub_counter(self, key: Literal["all", "read", "article", "comment", "like"]):
         if key == "all":
             self.counter[key] = {key: (self.counter[key] - 1) for key in self.counter.keys()}
         else:
             self.counter[key] = self.counter[key] - 1
 
-    def zero_counter(self, key: Literal["all","read","article","comment","like"]):
+    def zero_counter(self, key: Literal["all", "read", "article", "comment", "like"]):
         if key == "all":
             self.counter[key] = {key: 0 for key in self.counter.keys()}
             self.__status["done"] = True
@@ -320,7 +325,7 @@ class TaskLog(AttrDict):
             ),
             today = dict(),
         )
-        self.read_ids: dict[Literal["dst","src"], set[ArticleId]] = dict(dst=set(), src=set())
+        self.read_ids: dict[Literal["dst", "src"], set[ArticleId]] = dict(dst=set(), src=set())
         self.read_articles: list[ArticleActivity] = list()
         self.my_articles: deque[ArticleInfo] = deque()
         self.written_articles: list[NewArticle] = list()
@@ -393,6 +398,7 @@ class Farmer(BrowserController):
             src_wpm: Wpm = dict(),
             # vpn_config: VpnConfig = dict(),
             write_config: WorksheetConnection = dict(),
+            slack_config: SlackConfig = dict(),
             **kwargs
         ):
         super().__init__(None, "Default",
@@ -415,9 +421,10 @@ class Farmer(BrowserController):
         self.index: Index = 0
         self.mobile = mobile
         self.threshold = ActionThreshold(comment_threshold, like_threshold, write_threshold)
-        self.wpm: dict[Literal["dst","src"], Wpm] = dict(dst=dst_wpm, src=src_wpm)
+        self.wpm: dict[Literal["dst", "src"], Wpm] = dict(dst=dst_wpm, src=src_wpm)
         self.original_articles: set[tuple[CafeId, ArticleId]] = set()
 
+        self.slack = SlackClient(**slack_config) if slack_config else None
         # self.set_vpn_client(vpn_config)
 
         self.validate_worksheet_connection(write_config, empty=True)
@@ -458,7 +465,7 @@ class Farmer(BrowserController):
             max_read_length: int = 500,
             max_reply_length: int = 100,
             reload_start_step: int = 10,
-            reply_cutoff_date: dt.date | str | Literal["today","yesterday"] = "today",
+            reply_cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today",
             task_delay: float = 30.,
             # vpn_delay: float = 5.,
             verbose: int | str | Path = 0,
@@ -467,6 +474,7 @@ class Farmer(BrowserController):
             **kwargs
         ):
         self.check_quiet_hours()
+        self.notify_task_loop(loop_step=1)
 
         # if self.vpn_enabled:
         #     self.vpn.start_process(self.vpn_config.force_restart)
@@ -487,7 +495,7 @@ class Farmer(BrowserController):
                 step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
                 reply_cutoff_date, verbose, dry_run, save_log)
 
-    def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today","yesterday"] = "today") -> dt.date:
+    def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today") -> dt.date:
         if isinstance(cutoff_date, str):
             if cutoff_date == "today":
                 return dt.date.today()
@@ -499,15 +507,16 @@ class Farmer(BrowserController):
             return cutoff_date if isinstance(cutoff_date, dt.date) else dt.date.today()
 
     def wait_task_loop(self, loop_step: int, task_delay: float = 30., verbose: int | str | Path = 0):
-        delays = [delay for key in ["comment","article","error"]
+        delays = [delay for key in ["comment", "article", "error"]
             if isinstance(delay := self.min_action_delay(key), float)]
         min_delay = min(delays) if delays else 0.
 
         wait_delay = max(task_delay, min_delay)
         self.print_loop("task_loop_wait", loop_step, verbose, seconds=wait_delay)
+        self.notify_task_loop(loop_step, wait_delay)
         wait(wait_delay)
 
-    def min_action_delay(self, key: Literal["comment","article","error"]) -> float | None:
+    def min_action_delay(self, key: Literal["comment", "article", "error"]) -> float | None:
         delays = [max(0., config.delay[key] - secs)
             for config in self.configs
                 if ((key in config.delay)
@@ -583,6 +592,8 @@ class Farmer(BrowserController):
                 except:
                     pass
 
+            self.notify_action_end(loop_step, flag)
+
         return stop_task
 
     ###################### Single account actions #####################
@@ -603,6 +614,7 @@ class Farmer(BrowserController):
         self.navigate_to_menu()
         self.config.timer.start_timer("visit")
         write_timing = self.get_write_timing(num_my_articles)
+        self.notify_action_start(dry_run)
 
         max_action_steps = max_retries.get("action_loop") or 100
         max_read_steps = max_retries.get("read_loop") or 100
@@ -641,15 +653,12 @@ class Farmer(BrowserController):
         articles = self.read_loop(max_steps, max_read_length, reload_start_step, verbose)
 
         self.navigate_to_menu(referer="cafe", target="dst")
-        new_article = self.copy_and_write_article(articles, verbose, dry_run)
-        self.log.written_articles.append(new_article)
-
-        return new_article
+        return self.copy_and_write_article(articles, verbose, dry_run)
 
     def get_write_timing(
             self,
             num_my_articles: int = 10,
-        ) -> Literal["after","before","in_loop"] | None:
+        ) -> Literal["after", "before", "in_loop"] | None:
         if self.config.qualified or self.check_action_log(total_only=bool(self.log.user_info["today"])):
             self.config.qualify()
 
@@ -673,9 +682,11 @@ class Farmer(BrowserController):
         filter_ids = (lambda clubid = None, articleid = None, **kwargs: kwargs)
         data = [filter_ids(**article) for article in articles]
         new_article: ModifiedArticle = self.write_article(data, "modify", verbose, dry_run)
+
         if isinstance(new_article.get("origin"), int):
             origin = articles[new_article["origin"]]
             self.original_articles.add((origin["clubid"], origin["articleid"]))
+
         return new_article
 
     ############################# <start> #############################
@@ -789,7 +800,8 @@ class Farmer(BrowserController):
                     try:
                         activity = self.read_and_react(max_read_length, verbose, dry_run)
                         if activity:
-                            articles.append({key: activity[key] for key in ["title","contents","comments","created_at"]})
+                            keys = ["title", "contents", "comments", "created_at"]
+                            articles.append({key: activity[key] for key in keys})
                     finally:
                         go_back(self.page, self.delays.goto)
 
@@ -806,7 +818,7 @@ class Farmer(BrowserController):
 
             self.log.total_steps += 1
 
-    def get_prompt(self, file_name: str, target: Literal["dst","src"] = "dst", **replacements: str) -> dict:
+    def get_prompt(self, file_name: str, target: Literal["dst", "src"] = "dst", **replacements: str) -> dict:
         dst, src = self.config.cafe.dst, self.config.cafe.src
         replacements = dict(replacements, dst_cafe=dst.name, dst_menu=dst.menu, src_cafe=src.name, src_menu=src.menu)
 
@@ -825,7 +837,7 @@ class Farmer(BrowserController):
     def navigate_to_menu(
             self,
             referer: Literal["cafe"] | None = None,
-            target: Literal["dst","src"] = "dst",
+            target: Literal["dst", "src"] = "dst",
         ):
         if referer == "cafe":
             return_to_cafe_home(self.page, self.mobile, self.delays.goto)
@@ -843,6 +855,8 @@ class Farmer(BrowserController):
             except:
                 raise error
 
+        self.notify_cafe_switch(target)
+
     ############################# Action 9 ############################
 
     def check_action_log(self, total_only: bool = False) -> bool:
@@ -858,7 +872,7 @@ class Farmer(BrowserController):
 
         if not total_only:
             self.config.log.user_info["today"] = today
-            for key in ["article","comment"]:
+            for key in ["article", "comment"]:
                 daily_limit = self.config.limit[f"daily_{key}"]
                 if daily_limit and (daily_limit < today[key]):
                     self.config.zero_counter(key)
@@ -937,6 +951,7 @@ class Farmer(BrowserController):
             if comment:
                 self.config.sub_counter("comment")
                 self.config.timer.start_timer("comment")
+                self.notify_comment_action(article, comment)
         else:
             article = read_full_article(**common, action_delay=self.delays.action) # Action 5
         self.config.sub_counter("read")
@@ -947,6 +962,7 @@ class Farmer(BrowserController):
                 like_article(self.page, self.delays.action) # Action 6
             self.config.sub_counter("like")
             article["like_this"] = True
+            self.notify_like_action(article)
         else:
             article["like_this"] = False
 
@@ -959,7 +975,7 @@ class Farmer(BrowserController):
     def write_article(
             self,
             articles: list[ArticleInfo],
-            action: Literal["create","modify"] = "create",
+            action: Literal["create", "modify"] = "create",
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             update: bool = True,
@@ -983,12 +999,14 @@ class Farmer(BrowserController):
                 dry_run = dry_run,
                 **self.delays3,
             ) # Action 8
+            self.notify_article_action(new)
         finally:
             go_back(self.page, self.delays.goto)
         self.config.timer.start_timer("article")
 
         self.config.reset_counter("read")
         self.config.sub_counter("article")
+        self.log.written_articles.append(new)
 
         if self.log.my_articles.maxlen and update:
             for key in ["title", "contents", "created_at"]:
@@ -1145,6 +1163,7 @@ class Farmer(BrowserController):
                 counter = self.config.counter,
                 timer = self.config.timer.get_all_elapsed_times(ndigits=3),
             )
+
         elif task_step == "task_loop_start":
             body = dict(
                 task_step = task_step,
@@ -1153,6 +1172,7 @@ class Farmer(BrowserController):
                 config = self.config.public_items(),
                 state = str(state) if (state := kwargs.get("state")) else None,
             )
+
         elif task_step == "task_loop_wait":
             body = dict(
                 task_step = task_step,
@@ -1164,6 +1184,7 @@ class Farmer(BrowserController):
                             if (key in config.delay) and isinstance(secs, float)}
                         for i, config in enumerate(self.configs)},
             )
+
         else:
             body = dict(
                 task_step = task_step,
@@ -1242,8 +1263,146 @@ class Farmer(BrowserController):
             raise KeyError("구글시트 연결 정보에 'key' 또는 'sheet' 값이 없습니다.")
         return True
 
-    def _get_credentials(self, account: str | Path | Literal[":default:"] = ":default:",) -> ServiceAccount:
+    def _get_credentials(self, account: str | Path | Literal[":default:"] = ":default:") -> ServiceAccount:
         return ServiceAccount(DEFAULTS["account"] if is_default(account) else str(account))
+
+    ######################## Slack Notification #######################
+
+    def notify_slack(self, text: str, blocks: list | None = None):
+        if self.slack:
+            try: self.slack.chat_message(text, blocks=blocks)
+            except: pass
+
+    @property
+    def now(self) -> str:
+        return dt.datetime.now().strftime("%H:%M")
+
+    @property
+    def user_md(self) -> str:
+        return f"_*{self.config.userid}*_"
+
+    @property
+    def cafe_md(self) -> str:
+        return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu}"
+
+    def notify_task_loop(self, loop_step: int, wait_delay: float | None = None, sep: str = "  ·  "):
+        lines = list()
+
+        if loop_step == 1:
+            first_line = [f"[프로그램 시작]  {len(self.configs)}개 계정-카페 활동 대기"]
+        else:
+            first_line = [f"[프로그램 대기]  반복 횟수 {loop_step}"]
+            if wait_delay:
+                first_line.append(f"{seconds_to_mmss(wait_delay)} 후 재시작")
+        lines.append(first_line + [self.now])
+
+        lines.append(list())
+        max_userid_width = max([len(config.userid) for config in self.configs])
+
+        for config in self.configs:
+            userid = f"_*{config.userid}*_"
+            padding_count = max_userid_width - len(config.userid)
+            padding = "\u3000" * (ceil(padding_count / 2) + 1)
+
+            keys = ["article", "comment", "like"]
+            if loop_step == 1:
+                bars = {key: str(config.get_initial_count(key)) for key in keys}
+            else:
+                bars = {key: f"{config.calc_counter(key)}/{config.get_initial_count(key)}" for key in keys}
+
+            lines.append([
+                f"{config.no}. {userid}{padding}글 {bars['article']}", f"댓글 {bars['comment']}", f"좋아요 {bars['like']}"])
+
+        self.notify_slack('\n'.join(map(sep.join, lines)))
+
+    def notify_action_start(self, dry_run: bool = False, sep: str = "  ·  "):
+        config, log = self.config, self.log
+        bullet = ":black_medium_small_square: "
+
+        total = log.user_info["total"]
+        if dry_run:
+            today = {
+                "article": len(log.written_articles),
+                "comment": len([1 for activity in log.read_articles if activity.get("written_comment")]),
+            }
+        else:
+            today = log.user_info["today"]
+
+        def _bar(count: int, limit: int):
+            count = count if isinstance(count, int) else 0
+            return f"{count}/{limit}" if isinstance(limit, int) and limit else str(count)
+
+        total_keys = ["visit", "article", "comment"]
+        total_bars = {key: _bar(total.get(key), config.limit.get(key)) for key in total_keys}
+        today_bars = {key: _bar(today.get(key), config.limit.get("daily_"+key)) for key in total_keys[1:]}
+
+        self.notify_slack('\n'.join(map(sep.join, [
+            [f"[카페 활동 시작]  {self.user_md}", self.cafe_md, self.now],
+            [f"{bullet}전체 >  방문 {total_bars['visit']}", f"작성글 {total_bars['article']}", f"댓글 {total_bars['comment']}"],
+            [f"{bullet}오늘 >  작성글 {today_bars['article']}", f"댓글 {today_bars['comment']}"],
+        ])))
+
+    def notify_cafe_switch(self, target: Literal["dst", "src"], sep: str = "  ·  "):
+        config = self.config
+        cafe = config.cafe.src if target == "src" else config.cafe.dst
+        text = sep.join([f"[카페 이동]  {self.user_md}", f"{cafe.name} / {cafe.menu}", self.now])
+        self.notify_slack(text)
+
+    def notify_article_action(self, article: ModifiedArticle | NewArticle, sep: str = "  ·  "):
+        title = article.get("title") or "(제목 없음)"
+        contents = article.get("contents") or list()
+        url = self.page.url
+
+        self.notify_slack('\n'.join([
+            sep.join([f"[글쓰기]  {self.user_md}", self.cafe_md, self.now]),
+            f"<{url}|{title}>" if url else f"*{title}*",
+            *[(">"+line) for line in contents if line.strip() and (not line.startswith("!["))],
+        ]))
+
+    def notify_comment_action(self, article: ArticleInfo, comment: Comment, sep: str = "  ·  "):
+        title = article.get("title") or "(제목 없음)"
+        url = self.page.url
+
+        self.notify_slack('\n'.join([
+            sep.join([f"[댓글]  {self.user_md}", self.cafe_md, self.now]),
+            "글 >  {}".format(f"<{url}|{title}>" if url else f"*{title}*"),
+            f">{comment}",
+        ]))
+
+    def notify_like_action(self, article: dict, sep: str = "  ·  "):
+        title = article.get("title") or "(제목 없음)"
+        url = self.page.url
+
+        self.notify_slack('\n'.join([
+            sep.join([f"[좋아요]  {self.user_md}", self.cafe_md, self.now]),
+            "글 >  {}".format(f"<{url}|{title}>" if url else f"*{title}*"),
+        ]))
+
+    def notify_action_end(self, loop_step: int, flag: str | None, sep: str = "  ·  "):
+        config, log = self.config, self.log
+        bullet1 = bullet2 = ":black_medium_small_square: "
+
+        keys = ["article", "comment", "like"]
+        bars = {key: f"{config.calc_counter(key)}/{config.get_initial_count(key)}" for key in keys}
+        read_count = len(log.read_articles)
+        time_on = seconds_to_mmss(log.time_on_cafe) if isinstance(log.time_on_cafe, float) else '-'
+        reply_count = sum(len(r["replies"]) for r in log.written_replies)
+
+        if flag:
+            status = "실패"
+            bullet1 = f":small_red_triangle: {flag}{sep}"
+        else:
+            status = "완료" if self.config.done else "대기"
+
+        lines = [
+            [f"[카페 활동 {status}]  {self.user_md}", self.cafe_md, self.now],
+            [f"{bullet1}반복 횟수 {loop_step}", f"체류 시간 {time_on}", f"읽은 글 {read_count}"],
+            [f"{bullet2}글 {bars['article']}", f"댓글 {bars['comment']}", f"좋아요 {bars['like']}"],
+        ]
+        if reply_count:
+            lines[2].append(f"답글 {reply_count}")
+
+        self.notify_slack('\n'.join(map(sep.join, lines)))
 
     ########################## VPN Extension ##########################
 

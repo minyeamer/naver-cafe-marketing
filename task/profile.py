@@ -180,7 +180,7 @@ class ProfileManager(BrowserController):
         records = client.get_all_records()
         return [AccountWrapper(record) for record in records if record["userid"]]
 
-    def _get_credentials(self, account: str | Path | Literal[":default:"] = ":default:",) -> ServiceAccount:
+    def _get_credentials(self, account: str | Path | Literal[":default:"] = ":default:") -> ServiceAccount:
         return ServiceAccount(account["account"] if is_default(account) else str(account))
 
 
