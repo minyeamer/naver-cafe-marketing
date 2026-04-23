@@ -8,7 +8,7 @@ if getattr(sys, "frozen", False):
         _base, "playwright", "driver", "package", ".local-browsers"
     )
 
-from task.farm import Farmer, MaxRetries, QuiteHours
+from task.farm import Farmer, MaxRetries, QuiteTime
 from task.profile import ProfileManager
 
 from core.action import Wpm
@@ -48,7 +48,7 @@ class ReadConfig(TypedDict):
     configs: WorksheetConnection
     openai_key: str | Path
     mobile: bool
-    quiet_hours: QuiteHours
+    quiet_time: QuiteTime
     comment_threshold: float
     like_threshold: float
     write_threshold: float

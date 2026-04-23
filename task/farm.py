@@ -44,9 +44,9 @@ if TYPE_CHECKING:
     from core.agent import ArticleInfo, NewArticle, ModifiedArticle
     from extensions.gsheets import WorksheetConnection
 
-class QuiteHours(TypedDict):
-    start: int
-    end: int
+class QuiteTime(TypedDict):
+    start: str | int
+    end: str | int
 
 
 SECRETS_ROOT = ".secrets"
@@ -87,6 +87,28 @@ class ArticleIdInfo(TypedDict):
     contents: list[str]
     comments: list[str]
     created_at: str
+
+
+def randint(value: int | str) -> int:
+    if '~' in str(value):
+        try: return random.randint(*map(safe_int, value.split('~', 1)))
+        except: return 0
+    return safe_int(value)
+
+
+def safe_int(value: int | str) -> int:
+    try: return int(value)
+    except: return 0
+
+
+def to_seconds(value: int | str) -> int:
+    if isinstance(value, str):
+        if ':' in value:
+            seconds = 0
+            for i, part in enumerate(value.split(':')[:3]):
+                seconds += safe_int(part) * (60**(2-i))
+            return seconds
+    return safe_int(value)
 
 
 def seconds_to_mmss(secs: float) -> str:
@@ -190,17 +212,10 @@ class ConfigWrapper(AttrDict):
                 "menu_id": config["src_menu_id"], "menu": config["src_menu"]},
         )
 
-        def safe_int(value: int | str) -> int:
-            try: return int(value)
-            except: return 0
-
-        def randint(value: str) -> int:
-            return random.randint(*map(safe_int, value.split('~', 1))) if '~' in str(value) else safe_int(value)
-
         counter: ActionCount = {key[:-len("_count")]: randint(config[key]) for key in config.keys() if key.endswith("_count")}
         self.counter, self.__counter = counter.copy(), counter.copy()
 
-        self.delay: ActionDelay = {key[:-len("_delay")]: safe_int(config[key]) for key in config.keys() if key.endswith("_delay")}
+        self.delay: ActionDelay = {key[:-len("_delay")]: to_seconds(config[key]) for key in config.keys() if key.endswith("_delay")}
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
         self.reply_yn: bool = config["reply_yn"]
@@ -300,9 +315,10 @@ class ArticleActivity(TypedDict):
 
 
 ErrorFlag = Literal[
+    "Chrome 프로필 없음",
     # "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
-    "네이버 비밀번호 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
-    "가입카페 확인 불가", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "금지 시간대",
+    "네이버 계정 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
+    "카페 비회원", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "실행 금지 시간",
     "브라우저 조작 오류", "알 수 없는 오류", "오류 횟수 초과"]
 
 class ErrorLog(TypedDict):
@@ -389,7 +405,7 @@ class Farmer(BrowserController):
             goto_delay: Delay = (1, 3),
             reload_delay: Delay = (10, 12),
             upload_delay: Delay = (2, 4),
-            quiet_hours: QuiteHours = dict(),
+            quiet_time: QuiteTime = dict(),
             mobile: bool = True,
             comment_threshold: float = 0.3,
             like_threshold: float = 0.4,
@@ -405,8 +421,8 @@ class Farmer(BrowserController):
             device, headless, action_delay, goto_delay, reload_delay, upload_delay)
         self.profiles_path: Path = Path(profiles_path) if profiles_path else Path()
 
-        self.quiet_hours = quiet_hours
-        self.check_quiet_hours()
+        self.set_quite_time(quiet_time)
+        self.check_quiet_time()
 
         if isinstance(configs, dict):
             self.validate_worksheet_connection(configs, empty=False)
@@ -450,10 +466,21 @@ class Farmer(BrowserController):
     def delays3(self) -> dict[str,Delay]:
         return self.delays.get_delays(["action", "goto", "upload"])
 
-    def check_quiet_hours(self):
-        if self.quiet_hours:
-            hour = dt.datetime.now().hour
-            if self.quiet_hours["start"] <= hour <= self.quiet_hours["end"]:
+    def set_quite_time(self, quiet_time: QuiteTime = dict()):
+        if quiet_time:
+            now = dt.datetime.now().strftime("%H:%M:%S")
+            today = dt.date.today()
+            tomorrow = dt.date.today() + dt.timedelta(days=1)
+            for key in ["start", "end"]:
+                date = "{} ".format(tomorrow if quiet_time[key] < now else today)
+                quiet_time[key] = dt.datetime.strptime(date+quiet_time[key], "%Y-%m-%d %H:%M:%S")
+            self.quiet_time: dict[str, dt.datetime] = quiet_time
+        else:
+            self.quiet_time: dict[str, dt.datetime] = None
+
+    def check_quiet_time(self):
+        if self.quiet_time:
+            if self.quiet_time["start"] <= dt.datetime.now() <= self.quiet_time["end"]:
                 raise QuietHoursError("실행 금지 시간대입니다.")
 
     ########################### Entry Point ###########################
@@ -473,7 +500,7 @@ class Farmer(BrowserController):
             save_log: bool = True,
             **kwargs
         ):
-        self.check_quiet_hours()
+        self.check_quiet_time()
         self.notify_task_loop(loop_step=1)
 
         # if self.vpn_enabled:
@@ -558,7 +585,7 @@ class Farmer(BrowserController):
 
             try:
                 self.print_loop("task_loop_start", loop_step, verbose)
-                self.check_quiet_hours()
+                self.check_quiet_time()
 
                 # if self.vpn_enabled and (target_ip := self.config.ip_addr):
                 #     vpn_ip = self.ensure_vpn_connected(target_ip, vpn_ip, max_vpn_retries, vpn_delay)
@@ -706,7 +733,7 @@ class Farmer(BrowserController):
         src_read_ids = set()
 
         for step in range(1, max_steps+1):
-            self.check_quiet_hours()
+            self.check_quiet_time()
 
             if step > reload_start_step:
                 wait(self.delays.reload)
@@ -718,7 +745,7 @@ class Farmer(BrowserController):
                 self.page, src_read_ids, self.get_prompt("sample_articles", "src"), verbose) # Action 3
             self.log.read_ids["src"].update(src_read_ids)
             for params in selected:
-                self.check_quiet_hours()
+                self.check_quiet_time()
                 if (params["clubid"], params["articleid"]) in self.original_articles:
                     continue
 
@@ -782,7 +809,7 @@ class Farmer(BrowserController):
         self.config.reset_counter("read")
 
         for step in range(1, max_steps+1):
-            self.check_quiet_hours()
+            self.check_quiet_time()
 
             if not self.has_next_action(is_article_allowed):
                 break
@@ -796,7 +823,7 @@ class Farmer(BrowserController):
             selected = explore_articles(
                 self.page, self.log.read_ids["dst"], self.get_prompt("select_articles", "dst"), verbose) # Action 3
             for params in selected:
-                self.check_quiet_hours()
+                self.check_quiet_time()
 
                 if goto_article(self.page, params["articleid"], self.delays.goto): # Action 4
                     try:
@@ -1095,7 +1122,7 @@ class Farmer(BrowserController):
         elif isinstance(error, PromptNotFoundError):
             return "프롬프트 없음"
         elif isinstance(error, QuietHoursError):
-            return "금지 시간대"
+            return "실행 금지 시간"
         elif isinstance(error, PlaywrightTimeoutError):
             return "브라우저 조작 오류"
         else:
@@ -1144,7 +1171,7 @@ class Farmer(BrowserController):
             return False
 
         else:
-            return error_flag in {"프롬프트 없음", "금지 시간대"}
+            return error_flag in {"프롬프트 없음", "실행 금지 시간"}
 
     ############################# Task Log ############################
 
@@ -1285,7 +1312,8 @@ class Farmer(BrowserController):
 
     @property
     def cafe_md(self) -> str:
-        return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu}"
+        progress = f"{self.index+1}/{len(self.configs)}"
+        return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu} ({progress})"
 
     def notify_task_loop(
             self,
@@ -1356,7 +1384,8 @@ class Farmer(BrowserController):
     def notify_cafe_switch(self, target: Literal["dst", "src"], sep: str = "  ·  "):
         config = self.config
         cafe = config.cafe.src if target == "src" else config.cafe.dst
-        text = sep.join([f"[카페 이동]  {self.user_md}", f"{cafe.name} / {cafe.menu}", self.now])
+        progress = f"{self.index+1}/{len(self.configs)}"
+        text = sep.join([f"[카페 이동]  {self.user_md}", f"{cafe.name} / {cafe.menu} ({progress})", self.now])
         self.notify_slack(text)
 
     def notify_article_action(self, article: ModifiedArticle | NewArticle, sep: str = "  ·  "):
