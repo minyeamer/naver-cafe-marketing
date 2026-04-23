@@ -87,8 +87,8 @@ def run_farm(
         read: ReadConfig,
         farm: FarmConfig,
         # vpn: VpnConfig,
-        write: WorksheetConnection,
-        slack: SlackConfig,
+        write: WorksheetConnection = dict(),
+        slack: SlackConfig = dict(),
         **kwargs
     ) -> Farmer:
     farmer = Farmer(**browser, **read, write_config=write, slack_config=slack)

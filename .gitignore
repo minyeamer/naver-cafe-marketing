@@ -236,7 +236,8 @@ debug*.py
 debug*.sh
 
 # User defined
-.prompts/
-.secrets/
 .logs/
-copilot-instructions.md
+.prompts/
+.secrets/*
+!.secrets/config_example.yaml
+.github/copilot-instructions.md
