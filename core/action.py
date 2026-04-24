@@ -798,10 +798,17 @@ def reply_comments(
             replies = create_replies(article_info, **prompt, verbose=verbose, **kwargs) # Agent 3
 
             comment_areas = locate_all(page, ".comment_list li")
-            for comment_area, reply in zip([comment_areas[i] for i in comments.keys()], replies):
+            # 답글 대상은 nth-child 기준으로 선택되기 때문에 역순으로 등록한다.
+            for i, (nth, comment) in list(enumerate(comments.items()))[::-1]:
+                comment_area = comment_areas[nth]
+                if (i >= len(replies)) or (not replies[i]):
+                    continue
+                elif comment_area.locator(".txt").first.text_content() != comment:
+                    continue
+
                 comment_area.locator(".btn_write").first.tap()
                 comment_area.locator(".textarea_write").first.tap(), wait(action_delay)
-                comment_area.locator(".text_input_area").first.type(reply, delay=100), wait(action_delay)
+                comment_area.locator(".text_input_area").first.type(replies[i], delay=100), wait(action_delay)
                 if not dry_run:
                     comment_area.locator(".btn_area > button", has_text="등록").tap()
                 wait(upload_delay)
