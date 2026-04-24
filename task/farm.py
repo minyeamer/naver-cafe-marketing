@@ -1400,10 +1400,10 @@ class Farmer(BrowserController):
         else:
             second_line = list()
 
-            text = '\n'.join([
-                (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
-                *([bullet + sep.join(second_line)] if second_line else list()),
-            ])
+        text = '\n'.join([
+            (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
+            *([bullet + sep.join(second_line)] if second_line else list()),
+        ])
 
         rows = [["구분", "방문", "작성글", "댓글", "좋아요"]]
         rows.append(["전체",
