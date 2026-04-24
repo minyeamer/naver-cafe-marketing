@@ -1391,16 +1391,19 @@ class Farmer(BrowserController):
         else:
             bullet = ":black_small_square: "
 
-        second_line = [f"반복 횟수 {loop_step}"]
-        fields = ["read_articles", "time_on_cafe", "new_reply_count"]
-        for field, label in zip(fields, ["읽은 글", "체류 시간", "답글"]):
-            if (value := self.calculate_field(config.log, field)):
-                second_line.append(f"{label} {value}")
+        if not ((action_flag == "시작") and (loop_step == 1)):
+            second_line = [f"반복 횟수 {loop_step}"]
+            fields = ["read_articles", "time_on_cafe", "new_reply_count"]
+            for field, label in zip(fields, ["읽은 글", "체류 시간", "답글"]):
+                if (value := self.calculate_field(config.log, field)):
+                    second_line.append(f"{label} {value}")
+        else:
+            second_line = list()
 
-        text = '\n'.join([
-            (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
-            *([bullet + sep.join(second_line)] if loop_step > 1 else list()),
-        ])
+            text = '\n'.join([
+                (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
+                *([bullet + sep.join(second_line)] if second_line else list()),
+            ])
 
         rows = [["구분", "방문", "작성글", "댓글", "좋아요"]]
         rows.append(["전체",
