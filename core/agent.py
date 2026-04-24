@@ -48,6 +48,7 @@ class ArticleInfo(TypedDict):
     title: str
     contents: list[str]
     comments: list[str]
+    url: str
     created_at: str
 
 class NewComment(TypedDict, total=False):
@@ -119,6 +120,16 @@ def read_markdown(
     if user_message:
         messages.append({"role": "user", "content": user_message})
     return model, messages
+
+
+def parse_article(article_info: ArticleInfo, **kwargs) -> dict:
+    return {
+        "title": article_info["title"],
+        "contents": (article_info["contents"] or list()),
+        "comments": (article_info["comments"] or list()),
+        "created_at": article_info["created_at"],
+        **kwargs
+    }
 
 
 def min_json(data: dict | list) -> str:
@@ -282,7 +293,7 @@ def create_comment(
     """
     name = "create_comment"
     if messages is None:
-        data = dict(article_info, current_time=cur_time_str())
+        data = parse_article(article_info, current_time=cur_time_str())
         model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:
@@ -336,7 +347,7 @@ def create_replies(
     """
     name = "create_replies"
     if messages is None:
-        data = dict(article_info, current_time=cur_time_str())
+        data = parse_article(article_info, current_time=cur_time_str())
         model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:
@@ -345,14 +356,17 @@ def create_replies(
     if isinstance(reasoning_effort, str):
         kwargs["reasoning_effort"] = reasoning_effort
 
+    replies = list()
     try:
-        comments = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
-        return [comment["comment"] for comment in comments
+        for comment in chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs):
             if (isinstance(comment, dict) and comment.get("comment")
-                and not (comment.get("reject_reason") or comment.get("violation_reason")))]
+                and not (comment.get("reject_reason") or comment.get("violation_reason"))):
+                replies.append(comment["comment"])
+            else:
+                replies.append(str())
     except Exception as e:
         print_json({"agent_name": name, "error": str(type(e)), "message": str(e)}, verbose)
-    return list()
+    return replies
 
 
 ###################################################################
@@ -400,7 +414,11 @@ def create_article(
     """
     name = kwargs.pop("agent_name", "create_article")
     if messages is None:
-        data = {"articles": list(articles), "my_articles": list(my_articles), "current_time": cur_time_str()}
+        data = {
+            "articles": list(map(parse_article, articles)),
+            "my_articles": list(map(parse_article, my_articles)),
+            "current_time": cur_time_str()
+        }
         model, messages = read_markdown(markdown_path, min_json(data), model, **replacements)
         print_json({"agent_name": name, "user_message": data}, verbose)
     else:

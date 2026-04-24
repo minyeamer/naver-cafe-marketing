@@ -44,12 +44,13 @@ class Contents(TypedDict):
     read_end: int
     read_done: bool
 
-class Replies(TypedDict):
+class Replies(ArticleInfo):
     title: str
     contents: list[str]
     comments: list[str]
-    replies: list[str]
+    url: str
     created_at: str
+    replies: list[str]
 
 class Wpm(TypedDict):
     kor: int
@@ -396,13 +397,25 @@ def read_full_article(
         return _make_article_info(page, contents["lines"])
 
 
-def _make_article_info(page: Page, lines: list[str]) -> ArticleInfo:
+def _make_article_info(page: Page, lines: list[str], action_delay: Delay = (0.3, 0.6)) -> ArticleInfo:
     return {
         "title": page.locator(".post_title .tit").first.text_content().strip(),
         "contents": lines,
         "comments": read_comments(page),
+        "url": copy_article_url(page, action_delay),
         "created_at": to_iso_datetime_str(page.locator(".post_title .date").first.text_content().strip()),
     }
+
+
+def copy_article_url(page: Page, action_delay: Delay = (0.3, 0.6)) -> str:
+    try:
+        page.locator(".title_area .btn_more").first.tap(timeout=5000), wait(action_delay)
+        page.locator("a.btn", has_text="URL 복사").first.tap(), wait(action_delay)
+        url = page.evaluate("async () => await navigator.clipboard.readText()")
+        wait(action_delay)
+        return url if isinstance(url, str) and url.startswith("https://") else page.url
+    except:
+        return page.url
 
 
 def next_lines(page: Page, action_delay: Delay = (0.3, 0.6)):

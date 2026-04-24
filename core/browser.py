@@ -196,6 +196,7 @@ class BrowserController(AttrDict):
         )
         context = playwright.chromium.launch_persistent_context(str(profile_path), **kwargs)
         context.add_init_script(STEALTH_SCRIPT)
+        context.grant_permissions(["clipboard-read", "clipboard-write"])
         return context
 
     def authorize(self):

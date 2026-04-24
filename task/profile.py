@@ -81,20 +81,23 @@ class ProfileManager(BrowserController):
 
     def start(
             self,
-            prompt_close: bool = True,
+            interrupt: bool = True,
             skip_if_logged_in: bool = True,
             wait_interval: float = 0.25,
             **kwargs
         ):
+        if interrupt:
+            input("시작하려면 아무 키나 눌러주세요.")
+
         total = len(self.accounts)
         for i in range(total):
             self.index = i
 
             status = self.init_profile(self.profile["path"])
-            print(f"[{i}/{total}] {self.account.userid} {status}")
+            print(f"[{i+1}/{total}] {self.account.userid} {status}")
 
-            self.warmup_profile(skip_if_logged_in, prompt_close, wait_interval)
-            print(f"[{i}/{total}] {self.account.userid} 완료")
+            self.warmup_profile(skip_if_logged_in, interrupt, wait_interval)
+            print(f"[{i+1}/{total}] {self.account.userid} 완료")
 
     ########################## Manage Profile #########################
 
@@ -106,7 +109,7 @@ class ProfileManager(BrowserController):
     def warmup_profile(
             self,
             skip_if_logged_in: bool = True,
-            prompt_close: bool = True,
+            interrupt: bool = True,
             wait_interval: float = 0.25,
         ):
         with sync_playwright() as playwright:
@@ -117,7 +120,7 @@ class ProfileManager(BrowserController):
 
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=45_000)
-            self.wait_for_close(context, prompt_close, wait_interval)
+            self.wait_for_close(context, interrupt, wait_interval)
 
     def is_logged_in(self, context: BrowserContext) -> bool:
         try:
@@ -129,13 +132,13 @@ class ProfileManager(BrowserController):
     def wait_for_close(
             self,
             context: BrowserContext,
-            prompt_close: bool = True,
+            interrupt: bool = True,
             wait_interval: float = 0.25,
         ):
         done = threading.Event()
         context.on("close", lambda *_: done.set())
 
-        if prompt_close:
+        if interrupt:
             def input_watcher():
                 msg = "로그인 완료 후 아무 키나 누르면 브라우저를 닫습니다."
                 if self.account.passwd:
@@ -215,6 +218,7 @@ class ProfileDebugger:
         )
         self.context = self.playwright.chromium.launch_persistent_context(str(self.profile_path), **kwargs)
         self.context.add_init_script(STEALTH_SCRIPT)
+        self.context.grant_permissions(["clipboard-read", "clipboard-write"])
 
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
         self.page.goto(MAIN_URL, wait_until="domcontentloaded", timeout=45_000)
