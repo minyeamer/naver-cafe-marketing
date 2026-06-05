@@ -76,7 +76,7 @@ class ModifiedArticle(TypedDict, total=False):
 
 KEY_PATH = ".secrets/api.key"
 
-MODELS = {"gpt-4o-mini", "gpt-5-mini"}
+MODELS = {"gpt-5.4-nano", "gpt-5.4-mini"}
 PROMPTS_ROOT = ".prompts/"
 
 
@@ -246,7 +246,7 @@ def select_articles(
         kwargs["temperature"] = temperature
 
     try:
-        article_ids = set(chat_json(model or "gpt-4o-mini", messages, name, verbose, **kwargs))
+        article_ids = set(chat_json(model or "gpt-5.4-nano", messages, name, verbose, **kwargs))
         return [article for article in articles if article["articleid"] in article_ids]
     except Exception as e:
         print_json({"agent_name": name, "error": str(type(e)), "message": str(e)}, verbose)
@@ -303,7 +303,7 @@ def create_comment(
         kwargs["reasoning_effort"] = reasoning_effort
 
     try:
-        comment = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
+        comment = chat_json(model or "gpt-5.4-mini", messages, name, verbose, **kwargs)
         if comment.get("comment") and not (comment.get("reject_reason") or comment.get("violation_reason")):
             return comment["comment"]
     except Exception as e:
@@ -358,7 +358,7 @@ def create_replies(
 
     replies = list()
     try:
-        for comment in chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs):
+        for comment in chat_json(model or "gpt-5.4-mini", messages, name, verbose, **kwargs):
             if (isinstance(comment, dict) and comment.get("comment")
                 and not (comment.get("reject_reason") or comment.get("violation_reason"))):
                 replies.append(comment["comment"])
@@ -428,7 +428,7 @@ def create_article(
         kwargs["reasoning_effort"] = reasoning_effort
 
     try:
-        article = chat_json(model or "gpt-5-mini", messages, name, verbose, **kwargs)
+        article = chat_json(model or "gpt-5.4-mini", messages, name, verbose, **kwargs)
         if not article.get("violation_reason"):
             article["created_at"] = dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "+09:00"
             return article
