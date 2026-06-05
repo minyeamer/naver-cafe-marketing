@@ -31,6 +31,7 @@ class Account(TypedDict):
     userid: str
     passwd: str
     ip_addr: str
+    enabled: bool
 
 
 class AccountWrapper(AttrDict):
@@ -40,6 +41,7 @@ class AccountWrapper(AttrDict):
         self.userid = account["userid"]
         self.passwd = account.get("passwd")
         self.ip_addr = account.get("ip_addr")
+        self.enabled = account.get("enabled") or False
 
 
 class ProfileManager(BrowserController):
@@ -92,6 +94,9 @@ class ProfileManager(BrowserController):
         total = len(self.accounts)
         for i in range(total):
             self.index = i
+
+            if not self.account.enabled:
+                continue
 
             status = self.init_profile(self.profile["path"])
             print(f"[{i+1}/{total}] {self.account.userid} {status}")
