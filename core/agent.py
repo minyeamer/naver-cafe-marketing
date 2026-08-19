@@ -49,6 +49,7 @@ class ArticleInfo(TypedDict):
     contents: list[str]
     comments: list[str]
     url: str
+    copy_link: str | None
     created_at: str
 
 class NewComment(TypedDict, total=False):

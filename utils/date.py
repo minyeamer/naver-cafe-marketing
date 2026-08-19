@@ -53,14 +53,3 @@ def to_iso_datetime_str(text: str, default: str | None = None) -> str:
     except:
         pass
     return cur_time_str() if default is None else default
-
-
-
-    if (match := re.search(r"(\d{4}\.\d{2}\.\d{2}\. \d{2}:\d{2})", text)):
-        try:
-            datetime = dt.datetime.strptime(match.group(1), "%Y.%m.%d. %H:%M")
-            return datetime.strftime("%Y-%m-%dT%H:%M") + ":00+09:00"
-        except:
-            return cur_time_str() if default is None else default
-    else:
-        return cur_time_str() if default is None else default

@@ -8,7 +8,7 @@ from core.agent import ArticleInfo, create_comment, create_replies
 from core.agent import NewArticle, create_article
 from core.agent import ModifiedArticle, modify_article
 
-from utils.common import print_json, wait, Delay
+from utils.common import print_json, regexp_extract, wait, Delay
 from utils.date import to_iso_date, to_iso_date_str, to_iso_datetime, to_iso_datetime_str
 from utils.locator import Overlay, locate, locate_all
 from utils.locator import is_visible, range_boundaries
@@ -49,6 +49,7 @@ class Replies(ArticleInfo):
     contents: list[str]
     comments: list[str]
     url: str
+    copy_link: str | None
     created_at: str
     replies: list[str]
 
@@ -323,6 +324,7 @@ def read_article(
         wpm: Wpm = dict(),
         verbose: int | str | Path = 0,
         contents_only: bool = False,
+        copy_link: bool = True,
     ) -> ArticleInfo | Contents:
     """## Action 5"""
     lines, visible_lines = list(), list()
@@ -330,8 +332,13 @@ def read_article(
     word_count, read_start, read_end = 0, 0, 0
     _, min_y, _, max_y = range_boundaries(page, **get_cafe_ranges(page, header=True, tab=False))
 
-    selector = lambda tag: f'#postContent {tag}:not([style="display: none;"]):not(.se-module-oglink *)'
-    for i, el in enumerate(locate_all(page, ", ".join([selector('p'), selector("img")]))):
+    content = page.locator("#postContent > .ArticleSectionLoggerContent > .content").first
+    elements = content.locator(
+        'p:not([style="display: none;"]):not(.se-module-oglink *), '
+        'img:not([style="display: none;"]):not(.se-module-oglink *)'
+    ).all()
+
+    for i, el in enumerate(elements):
         tag_name = str(el.evaluate("el => el.tagName")).upper()
         if tag_name == "IMG":
             line = f"![{el.get_attribute('alt') or '이미지'}]({el.get_attribute('src')})"
@@ -368,7 +375,7 @@ def read_article(
         values = [lines, visible_lines, total_lines, word_count, read_start, read_end, read_done]
         return dict(zip(keys, values))
     else:
-        return _make_article_info(page, lines)
+        return _make_article_info(page, lines, copy_link)
 
 
 def read_full_article(
@@ -397,12 +404,18 @@ def read_full_article(
         return _make_article_info(page, contents["lines"])
 
 
-def _make_article_info(page: Page, lines: list[str], action_delay: Delay = (0.3, 0.6)) -> ArticleInfo:
+def _make_article_info(
+        page: Page,
+        lines: list[str],
+        action_delay: Delay = (0.3, 0.6),
+        copy_link: bool = True,
+    ) -> ArticleInfo:
     return {
         "title": page.locator(".post_title .tit").first.text_content().strip(),
         "contents": lines,
         "comments": read_comments(page),
-        "url": copy_article_url(page, action_delay),
+        "url": page.locator('meta[property="og:url"]').first.get_attribute("content"),
+        "copy_link": (copy_article_url(page, action_delay) if copy_link else None),
         "created_at": to_iso_datetime_str(page.locator(".post_title .date").first.text_content().strip()),
     }
 
@@ -642,7 +655,7 @@ def read_my_articles(
         if read_articles:
             safe_tap(item, **_get_info_ranges(page)), wait(goto_delay)
             try:
-                data.append(read_article(page, wpm, verbose, contents_only=False))
+                data.append(read_article(page, wpm, verbose, contents_only=False, copy_link=False))
             finally:
                 go_back(page, goto_delay)
         else:
@@ -667,6 +680,7 @@ def close_info(page: Page, goto_delay: Delay = (1, 3)):
 def read_action_log(
         page: Page,
         total_only: bool = False,
+        my_articles: Iterable[ArticleInfo] = list(),
         action_delay: Delay = (0.3, 0.6),
         goto_delay: Delay = (1, 3),
         today: dt.date | None = None,
@@ -685,7 +699,7 @@ def read_action_log(
         try:
             page.tap("header .info_link"), wait(goto_delay)
             try:
-                today_count = _read_daily_log(page, today_count, goto_delay, today)
+                today_count = _read_daily_log(page, today_count, goto_delay, today, my_articles)
             except:
                 pass
             finally:
@@ -702,6 +716,7 @@ def _read_daily_log(
         today_count: TodayCount,
         goto_delay: Delay = (1, 3),
         today: dt.date | None = None,
+        my_articles: Iterable[ArticleInfo] = list(),
     ) -> TodayCount:
     today = today if isinstance(today, dt.date) else dt.date.today()
     yesterday = dt.date.today() - dt.timedelta(days=1)
@@ -714,10 +729,12 @@ def _read_daily_log(
         today_count["last_article_ts"] = to_iso_datetime(page.locator(".post_title .date").first.text_content().strip())
         go_back(page, goto_delay)
 
+    my_ids = {my_id for article in my_articles if (my_id := regexp_extract(r"/articles/(\d+)", article["url"]))}
     page.locator('.tab_menu:has-text("작성댓글")').tap(), wait(goto_delay)
 
-    comments = [ts for item in locate_all(page, ".comment_item .date")
-        if (ts := to_iso_datetime(item.text_content().strip(), default=yesterday)).date() == today]
+    comments = [ts for item in locate_all(page, ".comment_item")
+        if ((ts := to_iso_datetime(item.locator(".date").first.text_content().strip(), default=yesterday)).date() == today)
+            and (regexp_extract(r'"content_id":\s*(\d+)', item.get_attribute("data-nlog-params")) not in my_ids)]
     today_count["comment"] = len(comments)
     if today_count["comment"] > 0:
         today_count["last_comment_ts"] = max(comments)

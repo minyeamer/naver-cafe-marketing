@@ -6,6 +6,7 @@ from typing import TypeVar, TYPE_CHECKING
 from pathlib import Path
 import json
 import random
+import re
 import time
 
 if TYPE_CHECKING:
@@ -71,6 +72,11 @@ def print_json(data: dict | list, verbose: int | str | Path = 0):
         with open(str(verbose), 'a', encoding="utf-8") as file:
             json.dump(data, file, indent=2, ensure_ascii=False, default=str)
             file.write('\n')
+
+
+def regexp_extract(pattern: re.Pattern | str, string: str, index: int = 0, default: Any | None = None) -> str:
+    match = re.search(pattern, string)
+    return match.groups()[index] if match else default
 
 
 def wait(delay: Delay | None = None, ndigits: int | None = None):

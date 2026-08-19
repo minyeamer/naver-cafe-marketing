@@ -22,14 +22,13 @@ from extensions.slack import SlackClient, SlackConfig
 # from extensions.vpn import VpnLoginFailedError, VpnInUseError, VpnFailedError
 # from extensions.vpn import WindowNotFoundError, ElementNotFoundError
 
-from utils.common import AttrDict, Delay, wait, print_json
+from utils.common import AttrDict, Delay, wait, print_json, regexp_extract
 from utils.timer import ActionTimer
 
 from typing import get_type_hints, Literal, TypeVar, TypedDict, TYPE_CHECKING
 from collections import deque
 import datetime as dt
 import json
-import re
 
 from pathlib import Path
 import os
@@ -110,11 +109,22 @@ def to_seconds(value: int | str) -> int:
     return safe_int(value)
 
 
-def seconds_to_hhmmss(secs: float) -> str:
-    total = int(round(secs))
+def seconds_to_hhmmss(seconds: float) -> str:
+    total = int(round(seconds))
     m, s = divmod(total, 60)
-    h, m = divmod(m, 60) if m >= 60 else 0, m
+    h, m = divmod(m, 60) if m >= 60 else (0, m)
     return (f"{h:02d}:" if h > 0 else str()) + f"{m:02d}:{s:02d}"
+
+
+def format_wait_time(seconds: float) -> str:
+    minutes = max(1, int(round(seconds / 60)))
+    hours, minutes = divmod(minutes, 60)
+    if hours and minutes:
+        return f"{hours}시간 {minutes}분"
+    elif hours:
+        return f"{hours}시간"
+    else:
+        return f"{minutes}분"
 
 
 def progress(step: int | None, total: int | None):
@@ -549,11 +559,11 @@ class Farmer(BrowserController):
         wait(wait_delay)
 
     def min_action_delay(self, key: Literal["comment", "article", "error"]) -> float | None:
-        delays = [max(0., config.delay[key] - secs)
+        delays = [max(0., config.delay[key] - elapsed)
             for config in self.configs
                 if ((key in config.delay)
                     and (config.counter.get(key, 1) > 0)
-                    and isinstance(secs := config.timer.get_elapsed_time(key), float))]
+                    and isinstance(elapsed := config.timer.get_elapsed_time(key), float))]
         return min(delays) if delays else None
 
     ############################# <start> #############################
@@ -573,12 +583,13 @@ class Farmer(BrowserController):
             dry_run: bool = False,
             save_log: bool = True,
         ) -> StopTask:
-        stop_task, error_flag = False, None
+        stop_task = False
         max_task_error = max_retries.get("task_error") or 10
         # vpn_ip, max_vpn_retries = None, max_retries.get("vpn_connect") or 10
 
         for i in range(len(self.configs)):
             self.index = i
+            error_flag = None
 
             if self.config.done:
                 continue
@@ -599,34 +610,68 @@ class Farmer(BrowserController):
                     reload_start_step, reply_cutoff_date, verbose, dry_run, proxy=self.config.ip_addr)
                 self.config.timer.end_timer("error")
             except Exception as error:
-                self.config.timer.start_timer("error")
-                error_flag = self.get_error_flag(error)
-                self.log.errors.append(dict(
-                    type = str(type(error).__name__),
-                    message = self.get_error_msg(error),
-                    exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
-                    error_flag = error_flag,
-                ))
-                if len(self.log.errors) > max_task_error:
-                    error_flag = "오류 횟수 초과"
+                try:
+                    error_flag = self.handle_error_task(error, max_task_error)
+                except Exception:
+                    error_flag = "알 수 없는 오류"
+            finally:
+                stop_task = self.finalize_task(loop_step, error_flag, verbose, save_log)
 
+        return stop_task
+
+    def handle_error_task(self, error: Exception, max_task_error: int = 10) -> ErrorFlag:
+        self.config.timer.start_timer("error")
+        error_flag = self.get_error_flag(error)
+        self.log.errors.append(dict(
+            type = str(type(error).__name__),
+            message = self.get_error_msg(error),
+            exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
+            flag = error_flag,
+        ))
+        if len(self.log.errors) > max_task_error:
+            return "오류 횟수 초과"
+        return error_flag
+
+    def finalize_task(
+            self,
+            loop_step: int,
+            error_flag: str | None = None,
+            verbose: int | str | Path = 0,
+            save_log: bool = True,
+        ) -> StopTask:
+        try:
             self.log.last_active_ts = dt.datetime.now()
             self.log.time_on_cafe = (self.log.time_on_cafe or 0.) + (self.config.timer.end_timer("visit", 3) or 0.)
+        except Exception:
+            pass
+
+        try:
             self.print_loop("task_loop_end", loop_step, verbose)
+        except Exception:
+            pass
 
-            if save_log:
-                self.save_log_json()
-
+        try:
             stop_task = self.handle_error_flag(error_flag)
+        except Exception:
+            stop_task = True
 
-            if self.write_config:
-                try:
-                    self.write_log_table_to_gsheets(**self.write_config)
-                except:
-                    pass
+        if save_log:
+            try:
+                self.save_log_json()
+            except Exception:
+                pass
 
+        if self.write_config:
+            try:
+                self.write_log_table_to_gsheets(**self.write_config)
+            except Exception:
+                pass
+
+        try:
             action_flag = "실패" if error_flag else ("완료" if self.config.done else "대기")
             self.notify_action_loop(loop_step, action_flag, error_flag)
+        except Exception:
+            pass
 
         return stop_task
 
@@ -896,7 +941,7 @@ class Farmer(BrowserController):
 
     def check_action_log(self, total_only: bool = False) -> bool:
         qualified = True
-        action_log = read_action_log(self.page, total_only, **self.delays2)
+        action_log = read_action_log(self.page, total_only, self.log.my_articles, **self.delays2)
         total, today = action_log["total"], action_log["today"]
 
         self.config.log.user_info["total"] = total
@@ -909,7 +954,7 @@ class Farmer(BrowserController):
             self.config.log.user_info["today"] = today
             for key in ["article", "comment"]:
                 daily_limit = self.config.limit[f"daily_{key}"]
-                if daily_limit and (daily_limit < today[key]):
+                if daily_limit and (daily_limit <= today[key]):
                     self.config.zero_counter(key)
                 if key not in self.config.timer:
                     self.config.timer.set_timer(key, today[f"last_{key}_ts"])
@@ -1121,7 +1166,7 @@ class Farmer(BrowserController):
             else:
                 return "네이버 로그인 오류"
         elif isinstance(error, CafeNotFoundError):
-            cafe_name = match.group(1) if (match := re.search(r"'([^']+)'", str(error))) else "확인불가"
+            cafe_name = regexp_extract(r"'([^']+)'", str(error), default="확인불가")
             return f"카페 비회원: {cafe_name}"
         elif isinstance(error, CafeBannedError):
             return "카페 활동정지"
@@ -1230,6 +1275,7 @@ class Farmer(BrowserController):
                 log = self.log.to_json(ellipsis_list=((not isinstance(verbose, int)) or (verbose < 3))),
             )
 
+        body["timestamp"] = dt.datetime.now().isoformat(timespec="seconds")
         print_json(body, verbose)
 
     def save_log_json(self):
@@ -1338,12 +1384,11 @@ class Farmer(BrowserController):
 
     @property
     def user_md(self) -> str:
-        return f"_*{self.config.userid}*_"
+        return f"_*{self.config.userid}*_ ({progress(self.index+1, len(self.configs))})"
 
     @property
     def cafe_md(self) -> str:
-        progress_ = progress(self.index+1, len(self.configs))
-        return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu} ({progress_})"
+        return f"{self.config.cafe.dst.name} / {self.config.cafe.dst.menu}"
 
     def notify_task_loop(
             self,
@@ -1355,18 +1400,25 @@ class Farmer(BrowserController):
         if loop_step > 1:
             first_line = [f"반복 횟수 {loop_step}"]
             if wait_delay:
-                first_line.append(f"{seconds_to_hhmmss(wait_delay)} 후 재시작")
+                first_line.append(f"{format_wait_time(wait_delay)} 후 재시작")
         else:
             first_line = [f"{len(self.configs)}개 계정-카페 활동 대기"]
         text = f"[프로그램 {task_flag}]  " + sep.join(first_line + [self.now])
 
-        rows = [["순서", "번호", "아이디", "카페명", "작성글", "댓글", "좋아요", "오늘 작성글", "오늘 댓글"]]
+        rows = [[
+            "순서", "번호", "아이디", "카페명",
+            "작성글 수\n(완료/할당)", "작성댓글 수\n(완료/할당)", "좋아요 수\n(완료/할당)",
+            "|", "금일 작성글 수\n(완료/한도)", "금일 작성댓글 수\n(완료/한도)"
+        ]]
+
         for i, config in enumerate(self.configs, start=1):
             rows.append([
                 str(i), str(config.no), config.userid, config.cafe.dst.name,
                 *[progress(self.calculate_field(config.log, f"new_{key}_count"), config.get_initial_count(key))
                     for key in ["article", "comment", "like"]],
-                *[progress(config.log.user_info["today"].get(key), config.limit.get("daily_"+key))
+                "|",
+                *[(progress(config.log.user_info["today"].get(key), config.limit.get("daily_"+key))
+                        if config.log.total_steps > 0 else '-')
                     for key in ["article", "comment"]],
             ])
 
@@ -1400,28 +1452,42 @@ class Farmer(BrowserController):
         else:
             second_line = list()
 
+        third_line = list()
+        for key, label in [("article", "글"), ("comment", "댓글")]:
+            if self.config.counter.get(key, 0) <= 0:
+                third_line.append(f"*{label}* | 금일 할당량 완료")
+                continue
+
+            delay = self.config.delay.get(key)
+            elapsed = self.config.timer.get_elapsed_time(key)
+            if (elapsed is None) or (elapsed >= delay):
+                third_line.append(f"*{label}* | 지금 작성 가능")
+            else:
+                third_line.append(f"*{label}* | {format_wait_time(delay - elapsed)} 후 작성 가능")
+
         text = '\n'.join([
             (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
             *([bullet + sep.join(second_line)] if second_line else list()),
+            f":hourglass_flowing_sand: {sep.join(third_line)}",
         ])
 
-        rows = [["구분", "방문", "작성글", "댓글", "좋아요"]]
-        rows.append(["전체",
-            *[config.log.user_info["total"].get(key) for key in ["visit", "article", "comment"]], ""])
-        rows.append(["오늘", "",
-            *[progress(config.log.user_info["today"].get(key), config.limit.get("daily_"+key))
-                for key in ["article", "comment"]], ""])
-        rows.append(["작업", "",
+        rows = [["구분", "방문 수", "작성글 수\n(완료/할당)", "작성댓글 수\n(완료/할당)", "좋아요 수\n(완료/할당)"]]
+        rows.append(["작업 예정", "",
             *[progress(self.calculate_field(config.log, f"new_{key}_count"), config.get_initial_count(key))
                 for key in ["article", "comment", "like"]]])
+        rows.append(["-----------", "", "", "", ""])
+        rows.append(["일일 한도", "",
+            *[progress(config.log.user_info["today"].get(key), config.limit.get("daily_"+key))
+                for key in ["article", "comment"]], ""])
+        rows.append(["전체 누적",
+            *[config.log.user_info["total"].get(key) for key in ["visit", "article", "comment"]], ""])
 
         self.notify_slack(text, blocks=[self.slack.create_table(rows)])
 
     def notify_cafe_switch(self, target: Literal["dst", "src"], sep: str = "  ·  "):
         config = self.config
         cafe = config.cafe.src if target == "src" else config.cafe.dst
-        progress_ = progress(self.index+1, len(self.configs))
-        text = sep.join([f"[카페 이동]  {self.user_md}", f"{cafe.name} / {cafe.menu} ({progress_})", self.now])
+        text = sep.join([f"[카페 이동]  {self.user_md}", f"{cafe.name} / {cafe.menu}", self.now])
         self.notify_slack(text)
 
     def notify_article_action(
@@ -1441,41 +1507,41 @@ class Farmer(BrowserController):
 
     def notify_comment_action(self, article: ArticleInfo, comment: Comment, sep: str = "  ·  "):
         title = article.get("title") or "(제목 없음)"
-        url = article.get("url")
+        link = article.get("copy_link")
 
         self.notify_slack('\n'.join([
             sep.join([f"[댓글]  {self.user_md}", self.cafe_md, self.now]),
-            "글 >  {}".format(f"<{url}|{title}>" if url else f"*{title}*"),
+            "글 >  {}".format(f"<{link}|{title}>" if link else f"*{title}*"),
             f">{comment}",
         ]))
 
     def notify_like_action(self, article: ArticleInfo, sep: str = "  ·  "):
         title = article.get("title") or "(제목 없음)"
-        url = article.get("url")
+        link = article.get("copy_link")
 
         self.notify_slack('\n'.join([
             sep.join([f"[좋아요]  {self.user_md}", self.cafe_md, self.now]),
-            "글 >  {}".format(f"<{url}|{title}>" if url else f"*{title}*"),
+            "글 >  {}".format(f"<{link}|{title}>" if link else f"*{title}*"),
         ]))
 
     def notify_reply_action(self, replies: list[Replies], sep: str = "  ·  "):
-        lines, urls, count = list(), set(), 0
+        lines, links, count = list(), set(), 0
         for article_info in replies:
             comments, replies = article_info["comments"], article_info["replies"]
             if len(comments) != len(replies): continue
 
-            url = article_info["url"]
-            urls.add(url)
+            link = article_info["copy_link"]
+            links.add(link)
 
             for comment, reply in zip(comments, replies):
                 if reply:
-                    lines.append("댓글 >  {}".format(f"<{url}|{comment}>" if url else f"*{comment}*"))
+                    lines.append("댓글 >  {}".format(f"<{link}|{comment}>" if link else f"*{comment}*"))
                     lines.append(f">{reply}")
                     count += 1
 
         self.notify_slack('\n'.join([
             sep.join([f"[답글]  {self.user_md}", self.cafe_md, self.now]),
-            f"_총 {len(urls)}개 글에서 {count}개 댓글에 답글 작성_",
+            f"_총 {len(links)}개 글에서 {count}개 댓글에 답글 작성_",
             *lines,
         ]))
 
