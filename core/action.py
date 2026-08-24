@@ -255,26 +255,38 @@ def _get_menu_overlay(page: Page) -> Overlay:
 def explore_articles(
         page: Page,
         visited: set[ArticleId] = set(),
+        read_articles_commented_only: bool = False,
         prompt: Prompt4 = dict(),
         verbose: int | str | Path = 0,
         **kwargs
     ) -> list[ArticleParams]:
     """## Action 3"""
-    articles = list_articles(page, visited)
-    if articles:
+    articles = list_articles(page, visited, read_articles_commented_only)
+    if read_articles_commented_only:
+        return articles
+    elif articles:
         return select_articles(articles, **prompt, verbose=verbose, **kwargs) # Agent 1
     else:
         return list()
 
 
-def list_articles(page: Page, visited: set[ArticleId] = set()) -> list[ArticleParams]:
+def list_articles(
+        page: Page,
+        visited: set[ArticleId] = set(),
+        read_articles_commented_only: bool = False,
+    ) -> list[ArticleParams]:
     articles = list()
-    for article in locate_all(page, ".mainLink", **get_cafe_ranges(page, header=True, tab=True)):
-        params = _parse_params(article.get_attribute("href") or str())
+    for article in locate_all(page, ".ArticleListItem", **get_cafe_ranges(page, header=True, tab=True)):
+        link, comment = article.locator(".mainLink").first, article.locator(".comment_area").first
+        if read_articles_commented_only and (comment.locator(".number").first.text_content().strip() == '0'):
+            continue
+
+        params = _parse_params(link.get_attribute("href") or str())
         if params["articleid"] not in visited:
             visited.add(params["articleid"])
-            params["title"] = article.locator(".tit").first.text_content().strip()
+            params["title"] = link.locator(".tit").first.text_content().strip()
             articles.append(params)
+
     return articles
 
 
@@ -719,7 +731,7 @@ def _read_daily_log(
         my_articles: Iterable[ArticleInfo] = list(),
     ) -> TodayCount:
     today = today if isinstance(today, dt.date) else dt.date.today()
-    yesterday = dt.date.today() - dt.timedelta(days=1)
+    yesterday = dt.datetime.today() - dt.timedelta(days=1)
 
     today_count["article"] = len([1 for item in locate_all(page, ".list_area .time")
         if to_iso_date(item.text_content().strip(), default=yesterday).date() == today])

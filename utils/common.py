@@ -75,8 +75,11 @@ def print_json(data: dict | list, verbose: int | str | Path = 0):
 
 
 def regexp_extract(pattern: re.Pattern | str, string: str, index: int = 0, default: Any | None = None) -> str:
-    match = re.search(pattern, string)
-    return match.groups()[index] if match else default
+    try:
+        match = re.search(pattern, string)
+        return match.groups()[index] if match else default
+    except:
+        return default
 
 
 def wait(delay: Delay | None = None, ndigits: int | None = None):
