@@ -62,7 +62,6 @@ class FarmConfig(TypedDict, total=False):
     max_reply_length: int
     reload_start_step: int
     reply_cutoff_date: dt.date | str | Literal["today"]
-    read_articles_commented_only: bool
     task_delay: float
     # vpn_delay: float
     verbose: int | str | Path

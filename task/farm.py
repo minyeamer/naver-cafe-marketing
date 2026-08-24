@@ -158,6 +158,7 @@ class Config(TypedDict):
     like_count: str
     min_line_limit: int
     comment_length: str
+    read_articles_commented_only: bool
     reply_yn: bool
     visit_limit: int
     comment_limit: int
@@ -232,6 +233,7 @@ class ConfigWrapper(AttrDict):
         self.delay: ActionDelay = {key[:-len("_delay")]: to_seconds(config[key]) for key in config.keys() if key.endswith("_delay")}
         self.limit: ActionLimit = {key[:-len("_limit")]: safe_int(config[key]) for key in config.keys() if key.endswith("_limit")}
         self.length: WordLength = {key[:-len("_length")]: config[key] for key in config.keys() if key.endswith("_length")}
+        self.read_articles_commented_only: bool = config["read_articles_commented_only"]
         self.reply_yn: bool = config["reply_yn"]
 
         self.__log: TaskLog = TaskLog(config)
@@ -507,7 +509,6 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today",
-            read_articles_commented_only: bool = False,
             task_delay: float = 30.,
             # vpn_delay: float = 5.,
             verbose: int | str | Path = 0,
@@ -536,7 +537,7 @@ class Farmer(BrowserController):
 
             stop_task = self.task_loop(
                 step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
-                reply_cutoff_date, read_articles_commented_only, verbose, dry_run, save_log)
+                reply_cutoff_date, verbose, dry_run, save_log)
 
     def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today") -> dt.date:
         if isinstance(cutoff_date, str):
@@ -579,7 +580,6 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | None = None,
-            read_articles_commented_only: bool = False,
             # vpn_delay: float = 5.,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -609,8 +609,7 @@ class Farmer(BrowserController):
 
                 self.do_actions(
                     loop_step, max_retries, num_my_articles, max_read_length, max_reply_length,
-                    reload_start_step, reply_cutoff_date, read_articles_commented_only, verbose, dry_run,
-                    proxy=self.config.ip_addr)
+                    reload_start_step, reply_cutoff_date, verbose, dry_run, proxy=self.config.ip_addr)
                 self.config.timer.end_timer("error")
             except Exception as error:
                 try:
@@ -690,7 +689,6 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | None = None,
-            read_articles_commented_only: bool = False,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
             **kwargs
@@ -702,18 +700,16 @@ class Farmer(BrowserController):
 
         max_action_steps = max_retries.get("action_loop") or 100
         max_read_steps = max_retries.get("read_loop") or 100
-        common = (max_read_length, reload_start_step)
+        common = (max_read_length, reload_start_step, verbose, dry_run)
 
         if (write_timing == BEFORE) and self.has_next_article():
-            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common, verbose, dry_run)
+            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
 
         is_article_allowed = (write_timing == IN_LOOP)
-        self.action_loop(
-            max_action_steps, is_article_allowed, *common,
-            read_articles_commented_only, verbose, dry_run)
+        self.action_loop(max_action_steps, is_article_allowed, *common)
 
         if (write_timing == AFTER) and self.has_next_article():
-            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common, verbose, dry_run)
+            self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
 
         if self.config.reply_yn:
             self.reply_my_articles(reply_cutoff_date, max_reply_length, verbose, dry_run)
@@ -723,7 +719,7 @@ class Farmer(BrowserController):
             self.config.qualify()
 
             if self.config.cafe.src.name:
-                self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common, verbose, dry_run)
+                self.read_src_cafe_and_write_dst_cafe(max_read_steps, *common)
 
     ###################### Read and write article #####################
 
@@ -859,7 +855,6 @@ class Farmer(BrowserController):
             is_article_allowed: bool = False,
             max_read_length: int = 500,
             reload_start_step: int = 10,
-            read_articles_commented_only: bool = False,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
         ):
@@ -879,7 +874,7 @@ class Farmer(BrowserController):
                 next_articles(self.page, self.delays.action)
 
             selected = explore_articles(
-                self.page, self.log.read_ids["dst"], read_articles_commented_only,
+                self.page, self.log.read_ids["dst"], self.config.read_articles_commented_only,
                 self.get_prompt("select_articles", "dst"), verbose) # Action 3
             for params in selected:
                 self.check_quiet_time()
@@ -1414,14 +1409,14 @@ class Farmer(BrowserController):
         text = f"[프로그램 {task_flag}]  " + sep.join(first_line + [self.now])
 
         rows = [[
-            "순서", "번호", "아이디", "카페명",
+            "순서", "번호", "아이디", "카페명", "게시판",
             "작성글 수\n(완료/할당)", "작성댓글 수\n(완료/할당)", "좋아요 수\n(완료/할당)",
             "|", "금일 작성글 수\n(완료/한도)", "금일 작성댓글 수\n(완료/한도)"
         ]]
 
         for i, config in enumerate(self.configs, start=1):
             rows.append([
-                str(i), str(config.no), config.userid, config.cafe.dst.name,
+                str(i), str(config.no), config.userid, config.cafe.dst.name, config.cafe.dst.menu,
                 *[progress(self.calculate_field(config.log, f"new_{key}_count"), config.get_initial_count(key))
                     for key in ["article", "comment", "like"]],
                 "|",
