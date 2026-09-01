@@ -16,6 +16,8 @@ from core.action import read_my_articles, open_info, close_info, read_action_log
 
 from core.agent import set_api_key, KEY_PATH, PROMPTS_ROOT
 
+from extensions.adb import AdbRuntimeError, IpAddrNotChangedError, MOBILE_IP_TOKEN
+from extensions.adb import ensure_adb_server_ready, rotate_mobile_ip_addr
 from extensions.gsheets import WorksheetClient, ServiceAccount, ACCOUNT_PATH
 from extensions.slack import SlackClient, SlackConfig
 # from extensions.vpn import VpnClient, VpnConfig, VpnRuntimeError
@@ -29,6 +31,7 @@ from typing import get_type_hints, Literal, TypeVar, TypedDict, TYPE_CHECKING
 from collections import deque
 import datetime as dt
 import json
+import time
 
 from pathlib import Path
 import os
@@ -331,7 +334,7 @@ class ArticleActivity(TypedDict):
 
 
 ErrorFlag = Literal[
-    "Chrome 프로필 없음",
+    "Chrome 프로필 없음", "adb 실행 오류", "IP주소 변경 실패",
     # "VPN 로그인 오류", "VPN 사용중", "VPN 접속 오류", "VPN 확인 불가", "VPN 조작 오류",
     "네이버 계정 불일치", "네이버 계정 보호조치", "네이버 CAPTCHA 발생", "네이버 로그인 오류",
     "카페 비회원", "카페 활동정지", "반복 횟수 초과", "프롬프트 없음", "실행 금지 시간",
@@ -415,8 +418,10 @@ class Farmer(BrowserController):
             configs: WorksheetConnection | Sequence[Config],
             profiles_path: str | Path,
             openai_key:  str | Path | Literal[":default:"] = ":default:",
+            adb_path: str | Path | None = None,
             device: str = str(),
             headless: bool = True,
+            clear_data: bool = False,
             action_delay: Delay = (0.3, 0.6),
             goto_delay: Delay = (1, 3),
             reload_delay: Delay = (10, 12),
@@ -434,8 +439,9 @@ class Farmer(BrowserController):
             **kwargs
         ):
         super().__init__(None, "Default",
-            device, headless, action_delay, goto_delay, reload_delay, upload_delay)
+            device, headless, clear_data, action_delay, goto_delay, reload_delay, upload_delay)
         self.profiles_path: Path = Path(profiles_path) if profiles_path else Path()
+        self.adb_path: Path | None = Path(adb_path) if adb_path else None
 
         self.set_quite_time(quiet_time)
         self.check_quiet_time()
@@ -510,6 +516,7 @@ class Farmer(BrowserController):
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today",
             task_delay: float = 30.,
+            action_delay: float = 600.,
             # vpn_delay: float = 5.,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -517,6 +524,7 @@ class Farmer(BrowserController):
             **kwargs
         ):
         self.check_quiet_time()
+        self.init_adb_server()
         self.notify_task_loop(loop_step=1, task_flag="시작")
 
         # if self.vpn_enabled:
@@ -537,7 +545,7 @@ class Farmer(BrowserController):
 
             stop_task = self.task_loop(
                 step, max_retries, num_my_articles, max_read_length, max_reply_length, reload_start_step,
-                reply_cutoff_date, verbose, dry_run, save_log)
+                reply_cutoff_date, action_delay, verbose, dry_run, save_log)
 
     def get_cutoff_date(self, cutoff_date: dt.date | str | Literal["today", "yesterday"] = "today") -> dt.date:
         if isinstance(cutoff_date, str):
@@ -580,6 +588,7 @@ class Farmer(BrowserController):
             max_reply_length: int = 100,
             reload_start_step: int = 10,
             reply_cutoff_date: dt.date | None = None,
+            action_delay: float = 600.,
             # vpn_delay: float = 5.,
             verbose: int | str | Path = 0,
             dry_run: bool = False,
@@ -597,19 +606,23 @@ class Farmer(BrowserController):
                 continue
             elif stop_task:
                 self.print_loop("task_loop_break", loop_step, verbose)
-                self.config.zero_counter("all")
-                continue
+                break
 
+            action_started_at = time.monotonic() if loop_step > 1 else None
             try:
                 self.print_loop("task_loop_start", loop_step, verbose)
                 self.check_quiet_time()
+
+                if self.is_mobile_proxy(self.config.ip_addr):
+                    self.run_mobile_proxy()
+                proxy = self.resolve_proxy(self.config.ip_addr)
 
                 # if self.vpn_enabled and (target_ip := self.config.ip_addr):
                 #     vpn_ip = self.ensure_vpn_connected(target_ip, vpn_ip, max_vpn_retries, vpn_delay)
 
                 self.do_actions(
                     loop_step, max_retries, num_my_articles, max_read_length, max_reply_length,
-                    reload_start_step, reply_cutoff_date, verbose, dry_run, proxy=self.config.ip_addr)
+                    reload_start_step, reply_cutoff_date, verbose, dry_run, proxy=proxy)
                 self.config.timer.end_timer("error")
             except Exception as error:
                 try:
@@ -617,19 +630,24 @@ class Farmer(BrowserController):
                 except Exception:
                     error_flag = "알 수 없는 오류"
             finally:
-                stop_task = self.finalize_task(loop_step, error_flag, verbose, save_log)
+                if all(config.done for config in self.configs[i+1:]):
+                    action_started_at = None
+                stop_task = self.finalize_task(
+                    loop_step, action_delay, action_started_at, error_flag, verbose, save_log)
 
         return stop_task
 
     def handle_error_task(self, error: Exception, max_task_error: int = 10) -> ErrorFlag:
         self.config.timer.start_timer("error")
         error_flag = self.get_error_flag(error)
+
         self.log.errors.append(dict(
             type = str(type(error).__name__),
             message = self.get_error_msg(error),
             exc_info = '\n'.join(traceback.format_exception(*sys.exc_info())),
             flag = error_flag,
         ))
+
         if len(self.log.errors) > max_task_error:
             return "오류 횟수 초과"
         return error_flag
@@ -637,6 +655,8 @@ class Farmer(BrowserController):
     def finalize_task(
             self,
             loop_step: int,
+            action_delay: float = 600.,
+            action_started_at: float | None = None,
             error_flag: str | None = None,
             verbose: int | str | Path = 0,
             save_log: bool = True,
@@ -669,11 +689,19 @@ class Farmer(BrowserController):
             except Exception:
                 pass
 
+        wait_delay = None
+        if (action_delay > 0.) and (loop_step > 1) and isinstance(action_started_at, float):
+            if not (self.config.done or stop_task):
+                wait_delay = max(0., action_delay - (time.monotonic() - action_started_at))
+
         try:
             action_flag = "실패" if error_flag else ("완료" if self.config.done else "대기")
-            self.notify_action_loop(loop_step, action_flag, error_flag)
+            self.notify_action_loop(loop_step, action_flag, error_flag, wait_delay)
         except Exception:
             pass
+
+        if isinstance(wait_delay, float) and (wait_delay > 0.):
+            wait(wait_delay)
 
         return stop_task
 
@@ -693,6 +721,7 @@ class Farmer(BrowserController):
             dry_run: bool = False,
             **kwargs
         ):
+        self.notify_playwright_proxy(**kwargs)
         self.navigate_to_menu()
         self.config.timer.start_timer("visit")
         write_timing = self.get_write_timing(num_my_articles)
@@ -840,6 +869,7 @@ class Farmer(BrowserController):
             return None
         else:
             article = read_full_article(self.page, self.delays.action, self.wpm["src"], verbose)
+            self.notify_read_action(article, target="src")
             self.config.sub_counter("read")
             return article
 
@@ -1049,6 +1079,9 @@ class Farmer(BrowserController):
         else:
             article["like_this"] = False
 
+        if not (article["written_comment"] or article["like_this"]):
+            self.notify_read_action(article, target="dst")
+
         self.log.read_articles.append(article)
 
         return article
@@ -1146,6 +1179,10 @@ class Farmer(BrowserController):
     def get_error_flag(self, error: Exception) -> ErrorFlag:
         if isinstance(error, ProfileNotFoundError):
             return "Chrome 프로필 없음"
+        elif isinstance(error, AdbRuntimeError):
+            return "adb 실행 오류"
+        elif isinstance(error, IpAddrNotChangedError):
+            return "IP주소 변경 실패"
         # elif isinstance(error, VpnRuntimeError):
         #     if isinstance(error, VpnLoginFailedError):
         #         return "VPN 로그인 오류"
@@ -1187,6 +1224,9 @@ class Farmer(BrowserController):
     def handle_error_flag(self, error_flag: ErrorFlag) -> StopTask:
         if not isinstance(error_flag, str):
             return False
+
+        elif error_flag in ("adb 실행 오류", "IP주소 변경 실패"):
+            return True
 
         # elif error_flag == "VPN 사용중":
         #     try:
@@ -1432,6 +1472,7 @@ class Farmer(BrowserController):
             loop_step: int,
             action_flag: Literal["시작", "대기", "완료", "실패"] | None = None,
             error_flag: str | None = None,
+            wait_delay: float | None = None,
             sep: str = "  ·  ",
         ):
         config = self.config
@@ -1467,6 +1508,9 @@ class Farmer(BrowserController):
                 third_line.append(f"*{label}* | 지금 작성 가능")
             else:
                 third_line.append(f"*{label}* | {format_wait_time(delay - elapsed)} 후 작성 가능")
+
+        if wait_delay:
+            third_line.append(f"다음 활동 {format_wait_time(wait_delay)} 후")
 
         text = '\n'.join([
             (f"[카페 활동 {action_flag}]  " + sep.join(first_line)),
@@ -1527,6 +1571,16 @@ class Farmer(BrowserController):
             "글 >  {}".format(f"<{link}|{title}>" if link else f"*{title}*"),
         ]))
 
+    def notify_read_action(self, article: ArticleInfo, target: Literal["src", "dst"]="dst", sep: str = "  ·  "):
+        title = article.get("title") or "(제목 없음)"
+        link = article.get("copy_link")
+        cafe = self.config.cafe.src if target == "src" else self.config.cafe.dst
+
+        self.notify_slack('\n'.join([
+            sep.join([f"[글 읽기]  {self.user_md}", f"{cafe.name} / {cafe.menu}", self.now]),
+            "글 >  {}".format(f"<{link}|{title}>" if link else f"*{title}*"),
+        ]))
+
     def notify_reply_action(self, replies: list[Replies], sep: str = "  ·  "):
         lines, links, count = list(), set(), 0
         for article_info in replies:
@@ -1547,6 +1601,45 @@ class Farmer(BrowserController):
             f"_총 {len(links)}개 글에서 {count}개 댓글에 답글 작성_",
             *lines,
         ]))
+
+    def notify_playwright_proxy(self, proxy: str | None = None, sep: str = "  ·  ", **kwargs):
+        if proxy:
+            self.notify_slack('\n'.join([
+                sep.join([f"[프록시 IP 적용]  {self.user_md}", self.now]),
+                f":white_checK_mark: {proxy}",
+            ]))
+
+    #################### Mobile Tethering Extension ###################
+
+    def is_mobile_proxy(self, ip_addr: str | None) -> bool:
+        return isinstance(ip_addr, str) and (ip_addr.strip().lower() == MOBILE_IP_TOKEN)
+
+    def resolve_proxy(self, ip_addr: str | None) -> str | None:
+        if self.is_mobile_proxy(ip_addr):
+            return None
+        return ip_addr or None
+
+    def init_adb_server(self):
+        if not any(self.is_mobile_proxy(config.ip_addr) for config in self.configs):
+            return
+        elif not (self.adb_path and self.adb_path.exists()):
+            raise FileNotFoundError(f"adb 실행 파일을 찾을 수 없습니다: {self.adb_path}")
+        ensure_adb_server_ready(self.adb_path)
+
+    def run_mobile_proxy(self, sep: str = "  ·  "):
+        try:
+            ensure_adb_server_ready(self.adb_path)
+            original_ip, new_ip = rotate_mobile_ip_addr(self.adb_path)
+            self.notify_slack('\n'.join([
+                sep.join([f"[모바일 IP 변경]  {self.user_md}", self.now]),
+                f":white_checK_mark: {original_ip} → {new_ip}",
+            ]))
+        except Exception:
+            self.notify_slack('\n'.join([
+                sep.join([f"[모바일 IP 변경 실패]  {self.user_md}", self.now]),
+                ":x: 비행기 모드 전환 후 60초 내 IP 변경 실패",
+            ]))
+            raise
 
     ########################## VPN Extension ##########################
 

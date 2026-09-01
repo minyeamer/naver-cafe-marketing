@@ -1,5 +1,6 @@
 from __future__ import annotations
 import functools
+import shutil
 
 from playwright.sync_api import Playwright, sync_playwright
 from playwright.sync_api import BrowserContext, Page
@@ -138,6 +139,7 @@ class BrowserController(AttrDict):
             profile_dir: str = "Default",
             device: str | None = None,
             headless: bool = True,
+            clear_data: bool = False,
             action_delay: Delay = (0.3, 0.6),
             goto_delay: Delay = (1, 3),
             reload_delay: Delay = (3, 5),
@@ -149,6 +151,7 @@ class BrowserController(AttrDict):
         self.__profile_dir = profile_dir
         self.device: str = device
         self.headless: bool = headless
+        self.clear_data: bool = clear_data
         self.delays: BrowserDelay = BrowserDelay(action_delay, goto_delay, reload_delay, upload_delay)
 
     @property
@@ -170,6 +173,9 @@ class BrowserController(AttrDict):
     def with_chrome_profile(func):
         @functools.wraps(func)
         def wrapper(self: BrowserController, *args, proxy: str | None = None, **kwargs):
+            if self.clear_data:
+                self.clear_browsing_data()
+
             with sync_playwright() as playwright:
                 context = self.launch_persistent_context(playwright, proxy)
                 page = context.new_page()
@@ -177,11 +183,54 @@ class BrowserController(AttrDict):
                 try:
                     self.__session.set(context, page)
                     self.authorize()
-                    return func(self, *args, **kwargs)
+                    return func(self, *args, proxy=proxy, **kwargs)
                 finally:
                     if self.__session:
                         self.__session.reset()
         return wrapper
+
+    def clear_browsing_data(self):
+        user_data_path = Path(self.profile["path"])
+        profile_dir = (self.profile.get("dir") or DEFAULT_DIR)
+        profile_path = user_data_path / profile_dir
+        if not profile_path.exists():
+            return
+
+        history_files = [
+            "History",
+            "History-journal",
+            "Visited Links",
+            "Top Sites",
+            "Top Sites-journal",
+            "Network Action Predictor",
+            "Network Action Predictor-journal",
+            "Shortcuts",
+            "Shortcuts-journal",
+        ]
+        cache_dirs = [
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "DawnCache",
+            "GrShaderCache",
+            "ShaderCache",
+            "Service Worker/CacheStorage",
+            "Service Worker/ScriptCache",
+        ]
+
+        for rel_path in history_files:
+            try:
+                if (target := profile_path / rel_path).exists():
+                    target.unlink()
+            except Exception:
+                pass
+
+        for rel_path in cache_dirs:
+            try:
+                if (target := profile_path / rel_path).exists():
+                    shutil.rmtree(target, ignore_errors=True)
+            except Exception:
+                pass
 
     def launch_persistent_context(self, playwright: Playwright, proxy: str | None = None) -> BrowserContext:
         profile_path: Path = self.profile["path"]

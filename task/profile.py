@@ -6,6 +6,8 @@ from playwright.sync_api import BrowserContext, Playwright, Page, sync_playwrigh
 from utils.common import AttrDict
 
 from extensions.gsheets import WorksheetClient, ServiceAccount
+from extensions.adb import ensure_adb_server_ready, rotate_mobile_ip_addr
+from extensions.adb import MOBILE_IP_TOKEN
 
 from pathlib import Path
 import threading
@@ -57,9 +59,12 @@ class ProfileManager(BrowserController):
             profiles_path: str | Path,
             device: str | None = None,
             headless: bool = False,
+            clear_data: bool = False,
+            adb_path: str | Path | None = None,
         ):
-        super().__init__(None, "Default", device, headless)
+        super().__init__(None, "Default", device, headless, clear_data)
         self.profiles_path = Path(profiles_path) if profiles_path else Path()
+        self.adb_path = Path(adb_path) if adb_path else None
 
         if isinstance(accounts, dict):
             self.validate_worksheet_connection(accounts)
@@ -91,12 +96,19 @@ class ProfileManager(BrowserController):
         if interrupt:
             input("시작하려면 아무 키나 눌러주세요.")
 
+        self.init_adb_server()
+
         total = len(self.accounts)
         for i in range(total):
             self.index = i
 
             if not self.account.enabled:
                 continue
+
+            if self.is_mobile_proxy(self.account.ip_addr):
+                ensure_adb_server_ready(self.adb_path)
+                original_ip, new_ip = rotate_mobile_ip_addr(self.adb_path)
+                print(f"[{i+1}/{total}] {self.account.userid} IP 변경: {original_ip} → {new_ip}")
 
             status = self.init_profile(self.profile["path"])
             print(f"[{i+1}/{total}] {self.account.userid} {status}")
@@ -117,8 +129,12 @@ class ProfileManager(BrowserController):
             interrupt: bool = True,
             wait_interval: float = 0.25,
         ):
+        if self.clear_data:
+            self.clear_browsing_data()
+
         with sync_playwright() as playwright:
-            context = self.launch_persistent_context(playwright, proxy=self.account.ip_addr)
+            proxy = self.resolve_proxy(self.account.ip_addr)
+            context = self.launch_persistent_context(playwright, proxy=proxy)
             if skip_if_logged_in and self.is_logged_in(context):
                 context.close()
                 return
@@ -170,6 +186,23 @@ class ProfileManager(BrowserController):
             context.close()
         except Exception:
             pass
+
+    #################### Mobile Tethering Extension ###################
+
+    def is_mobile_proxy(self, ip_addr: str | None) -> bool:
+        return isinstance(ip_addr, str) and (ip_addr.strip().lower() == MOBILE_IP_TOKEN)
+
+    def resolve_proxy(self, ip_addr: str | None) -> str | None:
+        if self.is_mobile_proxy(ip_addr):
+            return None
+        return ip_addr or None
+
+    def init_adb_server(self):
+        if not any(account.enabled and self.is_mobile_proxy(account.ip_addr) for account in self.accounts):
+            return
+        elif not (self.adb_path and self.adb_path.exists()):
+            raise FileNotFoundError(f"adb 실행 파일을 찾을 수 없습니다: {self.adb_path}")
+        ensure_adb_server_ready(self.adb_path)
 
     ########################## Read Accounts ##########################
 

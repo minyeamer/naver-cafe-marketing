@@ -39,14 +39,16 @@ class BrowserConfig(TypedDict, total=False):
     profiles_path: str | Path
     device: str
     headless: bool
+    clear_data: bool
     action_delay: Delay
     goto_delay: Delay
     reload_delay: Delay
     upload_delay: Delay
 
-class ReadConfig(TypedDict):
+class ReadConfig(TypedDict, total=False):
     configs: WorksheetConnection
     openai_key: str | Path
+    adb_path: str | Path | None
     mobile: bool
     quiet_time: QuiteTime
     comment_threshold: float
@@ -63,6 +65,7 @@ class FarmConfig(TypedDict, total=False):
     reload_start_step: int
     reply_cutoff_date: dt.date | str | Literal["today"]
     task_delay: float
+    action_delay: float
     # vpn_delay: float
     verbose: int | str | Path
     dry_run: bool
@@ -100,6 +103,7 @@ def run_profile(
         accounts: WorksheetConnection,
         browser: BrowserConfig,
         profile: ProfileConfig,
+        read: ReadConfig,
         **kwargs
     ) -> ProfileManager:
     manager = ProfileManager(
@@ -107,6 +111,8 @@ def run_profile(
         profiles_path = browser.get("profiles_path"),
         device = browser.get("device", MOBILE_DEVICE),
         headless = browser.get("headless", False),
+        clear_data = browser.get("clear_data", False),
+        adb_path = read.get("adb_path"),
     )
     manager.start(**profile)
     return manager

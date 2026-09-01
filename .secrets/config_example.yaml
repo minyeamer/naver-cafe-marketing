@@ -7,6 +7,7 @@ browser:
   profiles_path: ""           # 크롬 프로필 경로
   device: "Galaxy S24"        # 기기 명칭
   headless: false             # 브라우저 숨기기
+  clear_data: true            # 각 작업 시작 전 인터넷 사용 기록 삭제
   action_delay:               # 버튼 클릭 후 랜덤 대기 시간(초)
     - 0.3
     - 0.6
@@ -34,14 +35,13 @@ farm:
     task_loop: 30             # 최대 작업 사이클 수
     task_error: 10            # 작업 중 반복된 오류 발생 시 중지 (계정 당)
     action_loop: 100          # 최대 계정 활동 횟수 (1사이클 내)
-    read_loop: 100            # 최대 글 참조 횟수 (1사이클 내)
     # vpn_connect: 10         # VPN 연결 재시도 횟수
   num_my_articles: 10         # 조회할 내 게시글 수 (새 글 작성용)
   max_read_length: 500        # 글자 수 초과하면 읽지 않고 무시
-  max_reply_length: 100       # 글자 수 초과하면 답글 달지 않기
   reload_start_step: 20       # (글 목록 관련) n번 스크롤 내려보고 이후 새로고침 반복
   reply_cutoff_date: "today"  # 이 날짜부터 작성된 글에만 답글 작성 (yyyy-mm-dd, today, yesterday)
   task_delay: 30.0            # 작업 사이클 간 대기 시간
+  action_delay: 600.0         # 계정 활동 간 대기 시간 (2회차 사이클부터 반영)
   # vpn_delay: 5.0            # VPN 연결해제 후 대기 시간
   verbose: ""                 # 활동 로그 기록
   dry_run: false              # 글/댓글/좋아요 안함 (카운트/로그 기록만)
@@ -54,22 +54,18 @@ read:
     sheet: ""
     head: 1
   openai_key: ""              # OpenAI API 키 (또는 파일 경로)
+  adb_path: ""                # adb 실행 파일 경로
   mobile: true                # 데스크탑/모바일 (모바일만 허용)
   quiet_time:                 # 실행 금지 시간대 (시:분:초)
     start: ""
     end: ""
-  comment_threshold: 0.3      # 댓글 작성 확률 (0 ~ 1)
-  like_threshold: 0.4         # 좋아요 누를 확률 (0 ~ 1)
-  write_threshold: 0.4        # 글 작성 타이밍 (0 ~ 1에 가까워질수록 댓글 전에 글 작성)
+  comment_threshold: 0.1      # 댓글 작성 확률 (0 ~ 1, 작을수록 높은 확률)
+  like_threshold: 0.4         # 좋아요 누를 확률 (0 ~ 1, 작을수록 높은 확률)
+  write_threshold: 0.4        # 글 작성 타이밍 (0 ~ 1, 작을수록 댓글 전에 글 작성)
   dst_wpm:                    # (활동 카페)
     kor: 640                    # 분당 한글 글자 수
     eng: 952                    # 분당 영어 글자 수
     img: 120                    # 분당 이미지 수
-    wait: true                  # 글자 수만큼 글 읽을 때까지 대기
-  src_wpm:                    # (참조 카페)
-    kor: 180                    # 분당 한글 글자 수
-    eng: 238                    # 분당 영어 글자 수
-    img: 20                     # 분당 이미지 수
     wait: true                  # 글자 수만큼 글 읽을 때까지 대기
 
 write:                        # 구글 시트 (실행 결과, 주석 처리로 생략 가능)

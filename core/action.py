@@ -700,7 +700,8 @@ def read_action_log(
     open_menu(page, goto_delay)
     try:
         keys = [span.text_content().strip() for span in locate_all(page, ".myinfo_detail .detail_title")]
-        values = [_safe_int(span.text_content().strip()) for span in locate_all(page, ".myinfo_detail .detail_count")]
+        values = [(_safe_int(span.text_content().replace(',', '').strip()) or 0)
+                for span in locate_all(page, ".myinfo_detail .detail_count")]
         alias = {"방문": "visit", "작성글": "article", "댓글": "comment"}
         total_count: TotalCount = {alias[key]: value for key, value in zip(keys, values) if key in alias}
         today_count: TodayCount = dict(article=0, last_article_ts=None, comment=0, last_comment_ts=None)
